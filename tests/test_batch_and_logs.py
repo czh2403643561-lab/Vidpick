@@ -69,6 +69,9 @@ def test_result_fields_and_card_spacing_are_aligned() -> None:
 
     assert {label.width() for label in window.result_field_labels} == {44}
     assert [label.text() for label in window.result_field_labels] == ["状态", "博主", "作品", "类型", "详情"]
+    for card in (window.findChild(main.QGroupBox, "link_card"), window.findChild(main.QGroupBox, "result_card"), window.task_card, window.log_card):
+        assert card.title() == ""
+        assert card.findChild(main.QLabel, "card_title").height() == 20
     assert window.task_card.layout().contentsMargins().left() == 12
     assert window.log_card.layout().contentsMargins().left() == 12
     window.close()
