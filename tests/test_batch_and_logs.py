@@ -296,7 +296,7 @@ def test_batch_worker_passes_progress_and_continues_after_one_failure(monkeypatc
                 raise RuntimeError("页面不可用")
             return VideoInfo("测试博主", "测试作品", "正文", url)
 
-    def fake_save(info, root):
+    def fake_save(info, root, overwrite=False):
         folder = Path(root) / info.author
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{len(calls)}.txt"
@@ -327,17 +327,95 @@ def test_batch_worker_passes_progress_and_continues_after_one_failure(monkeypatc
     assert (success, skipped, failed) == (2, 0, 1)
 
 
-def test_batch_worker_saves_profile_desc_without_browser(monkeypatch, tmp_path) -> None:
+def test_batch_worker_saves_complete_profile_media_without_browser(monkeypatch, tmp_path) -> None:
     class UnexpectedSession:
         def __enter__(self):
-            raise AssertionError("已有正文不应启动浏览器")
+            raise AssertionError("完整主页媒体不应启动浏览器")
 
     monkeypatch.setattr(main, "DouyinSession", UnexpectedSession)
-    worker = main.BatchWorker([ProfileWork("https://www.douyin.com/note/1", "", "标题", "1", "博主", "完整正文")], tmp_path)
+    captured = []
+
+    def fake_save(info, root, overwrite=False):
+        captured.append(("text", info, overwrite))
+        folder = Path(root) / info.author / "标题__1"
+        folder.mkdir(parents=True)
+        path = folder / "content.txt"
+        path.write_text(info.content, encoding="utf-8")
+        return folder.parent, path, "2026-01-01T00:00:00+08:00"
+
+    def fake_media(info, work_dir, overwrite=False, progress=None):
+        captured.append(("media", info, overwrite))
+        image_dir = work_dir / "images"
+        image_dir.mkdir()
+        first = image_dir / "01.webp"
+        first.write_bytes(b"clean")
+        (image_dir / "02.webp").write_bytes(b"clean")
+        (work_dir / "cover.webp").write_bytes(first.read_bytes())
+        return MediaSaveResult(total=2, saved=2, cover_saved=True)
+
+    monkeypatch.setattr(main, "save_video", fake_save)
+    monkeypatch.setattr(main, "save_media", fake_media)
+    work = ProfileWork(
+        "https://www.douyin.com/note/1", "https://clean.example/01.webp", "标题", "1", "博主", "完整正文",
+        work_type="image", image_urls=("https://clean.example/01.webp", "https://clean.example/02.webp"), image_total=2,
+    )
+    worker = main.BatchWorker([work], tmp_path)
     completed = []
+    logs = []
     worker.succeeded.connect(completed.append)
+    worker.log.connect(logs.append)
     worker.run()
 
     folder, success, skipped, failed, _ = completed[0]
     assert folder.name == "博主"
     assert (success, skipped, failed) == (1, 0, 0)
+    assert [kind for kind, *_ in captured] == ["text", "media"]
+    saved_info = captured[0][1]
+    assert saved_info.image_urls == work.image_urls
+    assert saved_info.cover_url == work.image_urls[0]
+    assert (folder / "标题__1" / "images" / "01.webp").exists()
+    assert (folder / "标题__1" / "cover.webp").read_bytes() == b"clean"
+    assert "保存成功 1/1：标题 · 正文 + 2 张无水印图片" in logs
+
+
+def test_batch_worker_fetches_detail_only_when_profile_media_is_incomplete(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_video(self, url, progress=None):
+            calls.append(url)
+            return VideoInfo(
+                "博主", "标题", "完整正文", url, "1", "image",
+                "https://clean.example/01.webp", ("https://clean.example/01.webp", "https://clean.example/02.webp"), 2,
+            )
+
+    def fake_save(info, root, overwrite=False):
+        folder = Path(root) / info.author
+        folder.mkdir(parents=True)
+        path = folder / "content.txt"
+        path.write_text(info.content, encoding="utf-8")
+        return folder, path, "2026-01-01T00:00:00+08:00"
+
+    monkeypatch.setattr(main, "DouyinSession", FakeSession)
+    monkeypatch.setattr(main, "save_video", fake_save)
+    monkeypatch.setattr(main, "save_media", lambda info, *_args, **_kwargs: MediaSaveResult(total=2, saved=1, cover_saved=True))
+    work = ProfileWork(
+        "https://www.douyin.com/note/1", "https://clean.example/01.webp", "标题", "1", "博主", "主页正文",
+        work_type="image", image_urls=("https://clean.example/01.webp",), image_total=2,
+    )
+    worker = main.BatchWorker([work], tmp_path)
+    completed = []
+    logs = []
+    worker.succeeded.connect(completed.append)
+    worker.log.connect(logs.append)
+    worker.run()
+
+    assert calls == [work.url]
+    assert completed[0][1:4] == (1, 0, 0)
+    assert "保存完成 1/1：标题 · 正文成功，无水印图片 1/2" in logs

@@ -1,6 +1,6 @@
 import pytest
 
-from douyin_parser import DouyinParseError, DouyinSession, _find_aweme_object, _video_from_aweme, canonical_work_url, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
+from douyin_parser import DouyinParseError, DouyinSession, _find_aweme_object, _video_from_aweme, _works_from_awemes, canonical_work_url, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -71,8 +71,35 @@ def test_profile_cards_keep_structured_fields() -> None:
         "aweme_id": "123",
         "author": "博主",
         "desc": "完整正文",
+        "work_type": "image",
+        "cover_url": "https://clean.example/01.webp",
+        "image_urls": ("https://clean.example/01.webp", "https://clean.example/02.webp"),
+        "image_total": 2,
     }])[0]
-    assert (work.aweme_id, work.author, work.desc) == ("123", "博主", "完整正文")
+    assert (work.aweme_id, work.author, work.desc, work.work_type, work.cover_url, work.image_urls, work.image_total) == (
+        "123", "博主", "完整正文", "image", "https://clean.example/01.webp",
+        ("https://clean.example/01.webp", "https://clean.example/02.webp"), 2,
+    )
+
+
+def test_structured_profile_aweme_keeps_clean_image_media() -> None:
+    works = _works_from_awemes([{
+        "aweme_id": "123",
+        "desc": "图文正文",
+        "author": {"nickname": "测试博主"},
+        "images": [
+            {"url_list": ["https://clean.example/01.webp"], "download_url_list": ["https://watermark.example/01.webp"]},
+            {"url_list": ["https://clean.example/02.webp"], "download_url_list": ["https://watermark.example/02.webp"]},
+        ],
+    }])
+
+    assert len(works) == 1
+    work = works[0]
+    assert (work.work_type, work.cover_url, work.image_urls, work.image_total) == (
+        "image", "https://clean.example/01.webp",
+        ("https://clean.example/01.webp", "https://clean.example/02.webp"), 2,
+    )
+    assert all("watermark" not in value for value in work.image_urls)
 
 
 @pytest.mark.parametrize("url, expected", [

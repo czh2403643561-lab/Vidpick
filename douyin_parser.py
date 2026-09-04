@@ -39,6 +39,9 @@ class ProfileWork:
     aweme_id: str = ""
     author: str = ""
     desc: str = ""
+    work_type: str = ""
+    image_urls: tuple[str, ...] = ()
+    image_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -349,7 +352,7 @@ def _find_aweme_object(value: Any, target_aweme_id: str) -> dict[str, Any] | Non
     return None
 
 
-def normalize_profile_cards(cards: Iterable[dict[str, str]]) -> list[ProfileWork]:
+def normalize_profile_cards(cards: Iterable[dict[str, Any]]) -> list[ProfileWork]:
     """Clean/dedupe browser card data while keeping only real video or note links."""
 
     works: list[ProfileWork] = []
@@ -363,7 +366,18 @@ def normalize_profile_cards(cards: Iterable[dict[str, str]]) -> list[ProfileWork
         cover_url = str(card.get("cover_url", "")).strip()
         if not re.match(r"^https?://", cover_url, re.IGNORECASE):
             cover_url = ""
-        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品", aweme_id=str(card.get("aweme_id", "")), author=str(card.get("author", "")), desc=str(card.get("desc", ""))))
+        work_type = str(card.get("work_type", "")).strip()
+        if work_type not in {"image", "video"}:
+            work_type = ""
+        raw_image_urls = card.get("image_urls", ())
+        image_urls = tuple(value for value in raw_image_urls if isinstance(value, str) and value.startswith(("https://", "http://"))) if isinstance(raw_image_urls, (list, tuple)) else ()
+        try:
+            image_total = max(0, int(card.get("image_total", 0)))
+        except (TypeError, ValueError):
+            image_total = 0
+        if work_type == "image" and image_urls:
+            cover_url = image_urls[0]
+        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品", aweme_id=str(card.get("aweme_id", "")), author=str(card.get("author", "")), desc=str(card.get("desc", "")), work_type=work_type, image_urls=image_urls, image_total=image_total))
     return works
 
 
@@ -371,8 +385,8 @@ def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
     cards = []
     for item in items:
         aweme_id = str(item.get("aweme_id", "")); desc = _clean_text(item.get("desc", "")); author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
-        video = item.get("video", {}) if isinstance(item.get("video"), dict) else {}; cover = video.get("cover", {}) if isinstance(video.get("cover"), dict) else {}; urls = cover.get("url_list", []) if isinstance(cover.get("url_list"), list) else []
-        if aweme_id: cards.append({"url": f"https://www.douyin.com/{'note' if item.get('images') else 'video'}/{aweme_id}", "cover_url": urls[0] if urls else "", "title": desc, "aweme_id": aweme_id, "author": author, "desc": desc})
+        work_type, cover_url, image_urls, image_total = _media_from_aweme(item)
+        if aweme_id: cards.append({"url": f"https://www.douyin.com/{'note' if work_type == 'image' else 'video'}/{aweme_id}", "cover_url": cover_url, "title": desc, "aweme_id": aweme_id, "author": author, "desc": desc, "work_type": work_type, "image_urls": image_urls, "image_total": image_total})
     return normalize_profile_cards(cards)
 
 

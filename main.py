@@ -68,17 +68,15 @@ class BatchWorker(QObject):
             for index, work in enumerate(self.works, 1):
                     self.progress.emit(index, total, work.title, "准备保存")
                     try:
-                        if work.desc:
-                            info = VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id)
-                            self.progress.emit(index, total, work.title, "使用主页作品正文")
+                        if _profile_work_has_complete_media(work):
+                            info = VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id, work.work_type, work.cover_url, work.image_urls, work.image_total)
+                            self.progress.emit(index, total, work.title, "使用主页作品数据")
                         else:
                             if session is None: session = DouyinSession().__enter__()
                             info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
-                        if self.overwrite:
-                            output_dir, content_path, _ = save_video(info, self.output_root, overwrite=True)
-                        else:
-                            output_dir, content_path, _ = save_video(info, self.output_root)
-                        success += 1; self.log.emit(f"保存成功 {index}/{total}：{work.title}")
+                        output_dir, content_path, _ = save_video(info, self.output_root, overwrite=self.overwrite)
+                        media = save_media(info, content_path.parent, overwrite=self.overwrite, progress=lambda step: self.progress.emit(index, total, work.title, step))
+                        success += 1; self.log.emit(_batch_save_message(index, total, work.title, info, media))
                     except Exception as exc:
                         failed += 1; self.log.emit(f"保存失败 {index}/{total}：{work.title} — {str(exc) or '未知错误'}")
             self.succeeded.emit((output_dir, success, skipped, failed, time.monotonic() - started))
@@ -278,6 +276,23 @@ class MainWindow(QMainWindow):
 
 
 def _short(value: str, size: int) -> str: return value[:size] + ("…" if len(value) > size else "")
+def _profile_work_has_complete_media(work: ProfileWork) -> bool:
+    if not work.desc:
+        return False
+    if work.work_type == "image":
+        return bool(work.image_total and len(work.image_urls) == work.image_total and work.cover_url == work.image_urls[0])
+    return work.work_type == "video" and bool(work.cover_url)
+def _batch_save_message(index: int, total: int, title: str, info: VideoInfo, media) -> str:
+    prefix = f"{index}/{total}：{title}"
+    if info.work_type == "image":
+        if media.total and media.saved == media.total:
+            return f"保存成功 {prefix} · 正文 + {media.saved} 张无水印图片"
+        if media.saved:
+            return f"保存完成 {prefix} · 正文成功，无水印图片 {media.saved}/{media.total}"
+        return f"保存完成 {prefix} · 正文成功，未获取到可靠无水印图片"
+    if media.cover_saved:
+        return f"保存成功 {prefix} · 正文 + 封面"
+    return f"保存成功 {prefix} · 正文"
 def run() -> int:
     app = QApplication(sys.argv); app.setApplicationName("Vidpick"); app.setWindowIcon(QIcon(str(ICON_PATH))); window = MainWindow(); window.show(); return app.exec()
 if __name__ == "__main__": raise SystemExit(run())
