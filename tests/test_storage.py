@@ -197,7 +197,7 @@ def test_selected_assets_support_text_only_and_images_only(monkeypatch, tmp_path
     assert len(list(image_result.work_dir.glob("cover.*"))) == 1
     assert get_asset_state(image_only, tmp_path).images
     record = next(json.loads(line) for line in (image_result.author_dir / "data.jsonl").read_text(encoding="utf-8").splitlines() if '"2"' in line)
-    assert record["saved_assets"] == {"text": False, "images": True}
+    assert record["saved_assets"] == {"text": False, "images": True, "video": False}
     assert "content" not in record
 
 
@@ -233,7 +233,7 @@ def test_selected_assets_fill_missing_without_rewriting_and_merge_jsonl(monkeypa
     assert (third.work_dir / "images" / "01.webp").read_bytes() == image_bytes
     record = json.loads((third.author_dir / "data.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert record["content"] == "第一次正文"
-    assert record["saved_assets"] == {"text": True, "images": True}
+    assert record["saved_assets"] == {"text": True, "images": True, "video": False}
 
 
 def test_selected_overwrite_only_changes_requested_asset(monkeypatch, tmp_path) -> None:
@@ -260,3 +260,99 @@ def test_asset_state_is_complete_only_for_requested_options() -> None:
     assert state.is_complete_for(CollectionOptions(text=True, images=False))
     assert not state.is_complete_for(CollectionOptions(text=True, images=True))
     assert state.has_requested_asset(CollectionOptions(text=True, images=True))
+    video_missing = AssetState(text=True, images=True, video=False)
+    assert not video_missing.is_complete_for(CollectionOptions(text=True, images=True, video=True))
+    assert video_missing.has_requested_asset(CollectionOptions(text=True, images=True, video=True))
+    assert video_missing.is_complete_for(CollectionOptions(text=True, images=True, video=True), video_applicable=False)
+
+
+def test_video_only_save_is_independent_from_text_and_cover(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def fake_video_download(url, destination):
+        calls.append(url)
+        destination.write_bytes(b"clean-video")
+
+    monkeypatch.setattr(storage, "_download_video_to_path", fake_video_download)
+    info = VideoInfo(
+        "测试博主", "视频", "不应写入", "https://www.douyin.com/video/456", "456",
+        work_type="video", cover_url="https://cover/video.jpg", video_url="https://video.example/clean.mp4",
+    )
+
+    result = save_selected_assets(info, tmp_path, CollectionOptions(text=False, images=False, video=True))
+
+    assert calls == ["https://video.example/clean.mp4"]
+    assert (result.work_dir / "video.mp4").read_bytes() == b"clean-video"
+    assert not (result.work_dir / "content.txt").exists()
+    assert not list(result.work_dir.glob("cover.*"))
+    assert not (result.work_dir / "images").exists()
+    assert result.after == AssetState(video=True)
+    record = json.loads((result.author_dir / "data.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert record["saved_assets"] == {"text": False, "images": False, "video": True}
+
+
+def test_video_asset_state_and_selective_overwrite(monkeypatch, tmp_path) -> None:
+    versions = iter((b"first", b"second"))
+
+    def fake_video_download(_url, destination):
+        destination.write_bytes(next(versions))
+
+    monkeypatch.setattr(storage, "_download_video_to_path", fake_video_download)
+    info = VideoInfo("测试博主", "视频", "旧正文", "https://www.douyin.com/video/456", "456", work_type="video", cover_url="https://cover/video.jpg", video_url="https://video.example/clean.mp4")
+    first = save_selected_assets(info, tmp_path, CollectionOptions(text=True, images=False, video=True))
+    (first.work_dir / "cover.jpg").write_bytes(b"keep-cover")
+
+    overwritten = save_selected_assets(VideoInfo("测试博主", "视频", "新正文", info.url, "456", work_type="video", cover_url=info.cover_url, video_url=info.video_url), tmp_path, CollectionOptions(text=False, images=False, video=True), overwrite=True)
+
+    assert get_asset_state(info, tmp_path).video
+    assert overwritten.before.video and overwritten.after.video and overwritten.video_newly_saved
+    assert (overwritten.work_dir / "video.mp4").read_bytes() == b"second"
+    assert (overwritten.work_dir / "content.txt").read_text(encoding="utf-8") == "旧正文\n"
+    assert (overwritten.work_dir / "cover.jpg").read_bytes() == b"keep-cover"
+
+
+def test_video_download_failure_keeps_existing_file_and_cleans_part(monkeypatch, tmp_path) -> None:
+    destination = tmp_path / "video.mp4"
+    destination.write_bytes(b"old-complete-video")
+
+    class Headers:
+        @staticmethod
+        def get_content_type():
+            return "video/mp4"
+
+    class BrokenResponse:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _size):
+            if not hasattr(self, "read_once"):
+                self.read_once = True
+                return b"partial"
+            raise OSError("network interrupted")
+
+    monkeypatch.setattr(storage, "urlopen", lambda *_args, **_kwargs: BrokenResponse())
+    with pytest.raises(OSError, match="network interrupted"):
+        storage._download_video_to_path("https://video.example/clean.mp4", destination)
+
+    assert destination.read_bytes() == b"old-complete-video"
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_collection_options_support_video_but_require_one_resource() -> None:
+    assert CollectionOptions(text=False, images=False, video=True).video
+    with pytest.raises(storage.StorageError, match="至少选择"):
+        CollectionOptions(text=False, images=False, video=False)
+
+
+def test_video_only_rejects_image_without_creating_a_work_directory(tmp_path) -> None:
+    info = VideoInfo("测试博主", "图文", "正文", "https://www.douyin.com/note/1", "1", work_type="image")
+
+    with pytest.raises(storage.StorageError, match="图文作品"):
+        save_selected_assets(info, tmp_path, CollectionOptions(text=False, images=False, video=True))
+
+    assert not (tmp_path / "测试博主").exists()

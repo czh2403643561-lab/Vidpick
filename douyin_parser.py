@@ -29,6 +29,8 @@ class VideoInfo:
     cover_url: str = ""
     image_urls: tuple[str, ...] = ()
     image_total: int = 0
+    video_url: str = ""
+    video_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,8 @@ class ProfileWork:
     work_type: str = ""
     image_urls: tuple[str, ...] = ()
     image_total: int = 0
+    video_url: str = ""
+    video_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -371,13 +375,20 @@ def normalize_profile_cards(cards: Iterable[dict[str, Any]]) -> list[ProfileWork
             work_type = ""
         raw_image_urls = card.get("image_urls", ())
         image_urls = tuple(value for value in raw_image_urls if isinstance(value, str) and value.startswith(("https://", "http://"))) if isinstance(raw_image_urls, (list, tuple)) else ()
+        raw_video_urls = card.get("video_urls", ())
+        video_urls = tuple(value for value in raw_video_urls if isinstance(value, str) and value.startswith(("https://", "http://"))) if isinstance(raw_video_urls, (list, tuple)) else ()
+        video_url = str(card.get("video_url", "")).strip()
+        if not video_url.startswith(("https://", "http://")):
+            video_url = video_urls[0] if video_urls else ""
+        elif video_url not in video_urls:
+            video_urls = (video_url, *video_urls)
         try:
             image_total = max(0, int(card.get("image_total", 0)))
         except (TypeError, ValueError):
             image_total = 0
         if work_type == "image" and image_urls:
             cover_url = image_urls[0]
-        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品", aweme_id=str(card.get("aweme_id", "")), author=str(card.get("author", "")), desc=str(card.get("desc", "")), work_type=work_type, image_urls=image_urls, image_total=image_total))
+        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品", aweme_id=str(card.get("aweme_id", "")), author=str(card.get("author", "")), desc=str(card.get("desc", "")), work_type=work_type, image_urls=image_urls, image_total=image_total, video_url=video_url if work_type == "video" else "", video_urls=video_urls if work_type == "video" else ()))
     return works
 
 
@@ -385,15 +396,15 @@ def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
     cards = []
     for item in items:
         aweme_id = str(item.get("aweme_id", "")); desc = _clean_text(item.get("desc", "")); author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
-        work_type, cover_url, image_urls, image_total = _media_from_aweme(item)
-        if aweme_id: cards.append({"url": f"https://www.douyin.com/{'note' if work_type == 'image' else 'video'}/{aweme_id}", "cover_url": cover_url, "title": desc, "aweme_id": aweme_id, "author": author, "desc": desc, "work_type": work_type, "image_urls": image_urls, "image_total": image_total})
+        work_type, cover_url, image_urls, image_total, video_urls = _media_from_aweme(item)
+        if aweme_id: cards.append({"url": f"https://www.douyin.com/{'note' if work_type == 'image' else 'video'}/{aweme_id}", "cover_url": cover_url, "title": desc, "aweme_id": aweme_id, "author": author, "desc": desc, "work_type": work_type, "image_urls": image_urls, "image_total": image_total, "video_url": video_urls[0] if video_urls else "", "video_urls": video_urls})
     return normalize_profile_cards(cards)
 
 
 def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
     author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
     desc = _clean_text(item.get("desc", ""))
-    work_type, cover_url, image_urls, image_total = _media_from_aweme(item)
+    work_type, cover_url, image_urls, image_total, video_urls = _media_from_aweme(item)
     return VideoInfo(
         author=author,
         title=_first_line(desc, 80) or "未命名作品",
@@ -404,10 +415,12 @@ def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
         cover_url=cover_url,
         image_urls=image_urls,
         image_total=image_total,
+        video_url=video_urls[0] if video_urls else "",
+        video_urls=video_urls,
     )
 
 
-def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...], int]:
+def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...], int, tuple[str, ...]]:
     """Read media only from the already verified target aweme object."""
 
     images = item.get("images")
@@ -431,7 +444,7 @@ def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...], 
         if image_total:
             # download_url_list is intentionally excluded: real Douyin data marks it
             # with tplv-dy-water-v2 and it contains the account watermark.
-            return "image", image_urls[0] if image_urls else "", tuple(image_urls), image_total
+            return "image", image_urls[0] if image_urls else "", tuple(image_urls), image_total, ()
 
     video = item.get("video")
     cover_url = ""
@@ -440,7 +453,65 @@ def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...], 
             cover_url = _first_url(video.get(key))
             if cover_url:
                 break
-    return "video", cover_url, (), 0
+    return "video", cover_url, (), 0, _clean_video_urls(video)
+
+
+def _clean_video_urls(video: Any) -> tuple[str, ...]:
+    """Return tested clean video playback candidates, never download_addr.
+
+    Real Douyin responses expose watermark-free H.264 MP4 streams through
+    ``bit_rate[].play_addr`` while ``download_addr`` carries the account mark.
+    Prefer the highest-resolution normal H.264 MP4 variant, then reliable
+    playback-address fallbacks.  URLs are short-lived and are validated again
+    by the storage downloader before writing a file.
+    """
+
+    if not isinstance(video, dict):
+        return ()
+    ranked: list[tuple[tuple[int, int, int], tuple[str, ...]]] = []
+    bit_rates = video.get("bit_rate")
+    if isinstance(bit_rates, list):
+        for entry in bit_rates:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("format", "")).lower() != "mp4":
+                continue
+            if bool(entry.get("is_h265")) or bool(entry.get("is_bytevc1")):
+                continue
+            address = entry.get("play_addr_h264")
+            if not isinstance(address, dict):
+                address = entry.get("play_addr")
+            urls = _video_urls_from_address(address)
+            if not urls:
+                continue
+            width = _as_int(address.get("width"))
+            height = _as_int(address.get("height"))
+            bit_rate = _as_int(entry.get("bit_rate"))
+            ranked.append(((width * height, bit_rate, 1), urls))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    candidates: list[str] = []
+    for _score, urls in ranked:
+        candidates.extend(urls)
+    for key in ("play_addr_h264", "play_addr"):
+        candidates.extend(_video_urls_from_address(video.get(key)))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _video_urls_from_address(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, dict):
+        return ()
+    urls = value.get("url_list")
+    if not isinstance(urls, list):
+        return ()
+    return tuple(url for url in urls if isinstance(url, str) and url.startswith(("https://", "http://")))
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clean_image_urls(image: dict[str, Any]) -> tuple[str, ...]:

@@ -22,6 +22,8 @@ def test_collection_options_persist_and_settings_require_one_choice(tmp_path) ->
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
     main._save_collection_options(settings, CollectionOptions(text=False, images=True))
     assert main._load_collection_options(settings) == CollectionOptions(text=False, images=True)
+    main._save_collection_options(settings, CollectionOptions(text=False, images=False, video=True))
+    assert main._load_collection_options(settings) == CollectionOptions(text=False, images=False, video=True)
 
     app = QApplication.instance() or QApplication([])
     dialog = main.SettingsDialog(CollectionOptions())
@@ -30,7 +32,15 @@ def test_collection_options_persist_and_settings_require_one_choice(tmp_path) ->
     assert not dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
     dialog.text.setChecked(True)
     assert dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
+    dialog.text.setChecked(False)
+    dialog.video.setChecked(True)
+    assert dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
     dialog.close()
+
+    legacy_settings = QSettings(str(tmp_path / "legacy-settings.ini"), QSettings.IniFormat)
+    legacy_settings.setValue("collect_text", False)
+    legacy_settings.setValue("collect_images", True)
+    assert main._load_collection_options(legacy_settings) == CollectionOptions(text=False, images=True, video=False)
 
 
 def test_collection_status_reflects_options_refreshes_and_survives_mode_switch(tmp_path, monkeypatch) -> None:
@@ -41,6 +51,7 @@ def test_collection_status_reflects_options_refreshes_and_survives_mode_switch(t
     assert not window.collection_status.isHidden()
     assert window.collection_text_state.text() == ("✓" if window.options.text else "未选")
     assert window.collection_images_state.text() == ("✓" if window.options.images else "未选")
+    assert window.collection_video_state.text() == ("✓" if window.options.video else "未选")
 
     class FakeSettingsDialog:
         def __init__(self, *_args, **_kwargs):
@@ -56,6 +67,7 @@ def test_collection_status_reflects_options_refreshes_and_survives_mode_switch(t
     window._edit_settings()
     assert window.collection_text_state.text() == "未选"
     assert window.collection_images_state.text() == "✓"
+    assert window.collection_video_state.text() == "未选"
 
     window.mode_buttons["batch"].click()
     window.mode_buttons["single"].click()
@@ -88,6 +100,21 @@ def test_recognize_does_not_start_a_second_worker_when_thread_exists(monkeypatch
 
     assert started == []
     window.close()
+
+
+def test_save_worker_emits_saved_result_without_undefined_media(monkeypatch, tmp_path) -> None:
+    result = SelectedSaveResult(tmp_path / "博主", tmp_path / "博主" / "作品__1", AssetState(), AssetState(text=True), True, MediaSaveResult(), "2026-09-04")
+    monkeypatch.setattr(main, "save_selected_assets", lambda *_args, **_kwargs: result)
+    worker = main.SaveWorker(VideoInfo("博主", "作品", "正文", "https://www.douyin.com/video/1", "1"), tmp_path, CollectionOptions())
+    succeeded = []
+    failed = []
+    worker.succeeded.connect(succeeded.append)
+    worker.failed.connect(failed.append)
+
+    worker.run()
+
+    assert succeeded == [result]
+    assert failed == []
 
 
 def test_single_mode_hides_selection_and_busy_recognize_button_is_disabled(monkeypatch) -> None:
@@ -260,6 +287,17 @@ def test_single_save_log_marks_risky_only_image_source_as_unavailable() -> None:
     window.close()
 
 
+def test_video_save_logs_success_and_top_up_message() -> None:
+    info = VideoInfo("测试博主", "视频作品", "正文", "https://www.douyin.com/video/1", "1", work_type="video", video_url="https://video.example/clean.mp4")
+    only_video = CollectionOptions(text=False, images=False, video=True)
+    first = SelectedSaveResult(Path("output"), Path("output") / "作品__1", AssetState(), AssetState(video=True), False, MediaSaveResult(), "2026-09-04", video_saved=True, video_newly_saved=True)
+    assert main._selected_save_message("视频作品", info, first, only_video) == "保存成功：视频作品 · 视频"
+
+    combined = CollectionOptions(text=True, images=False, video=True)
+    topped_up = SelectedSaveResult(Path("output"), Path("output") / "作品__1", AssetState(text=True), AssetState(text=True, video=True), False, MediaSaveResult(), "2026-09-04", video_saved=True, video_newly_saved=True)
+    assert main._selected_save_message("视频作品", info, topped_up, combined) == "补齐完成：视频作品 · 新增视频"
+
+
 class FakeMessageBox:
     Warning = 1
     AcceptRole = 2
@@ -308,6 +346,21 @@ def test_single_duplicate_cancel_or_overwrite_is_handled_in_ui(monkeypatch) -> N
     window._start()
     assert len(started) == 1
     assert started[0].overwrite is True
+    window.close()
+
+
+def test_video_only_rejects_image_work_without_starting_task(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    window.single = VideoInfo("测试博主", "图文", "正文", "https://www.douyin.com/note/1", "1", work_type="image")
+    window.options = CollectionOptions(text=False, images=False, video=True)
+    started = []
+    monkeypatch.setattr(window, "_run", started.append)
+
+    window._start()
+
+    assert started == []
+    assert window.step.text() == "该作品为图文作品，没有可采集的视频。"
     window.close()
 
 
@@ -476,3 +529,62 @@ def test_batch_worker_fetches_detail_only_when_profile_media_is_incomplete(monke
     assert calls == [work.url]
     assert completed[0][1:4] == (1, 0, 0)
     assert "保存完成 1/1：标题 · 文案成功，无水印图片 1/2" in logs
+
+
+def test_batch_worker_saves_profile_video_without_detail_page(monkeypatch, tmp_path) -> None:
+    class UnexpectedSession:
+        def __enter__(self):
+            raise AssertionError("完整主页视频不应打开详情页")
+
+    captured = []
+
+    def fake_save(info, root, options, overwrite=False, progress=None):
+        captured.append(info)
+        folder = Path(root) / info.author
+        folder.mkdir(parents=True)
+        work_dir = folder / "视频__1"
+        work_dir.mkdir()
+        (work_dir / "video.mp4").write_bytes(b"clean-video")
+        return SelectedSaveResult(folder, work_dir, AssetState(), AssetState(video=True), False, MediaSaveResult(), "2026-09-04", video_saved=True, video_newly_saved=True)
+
+    monkeypatch.setattr(main, "DouyinSession", UnexpectedSession)
+    monkeypatch.setattr(main, "save_selected_assets", fake_save)
+    work = ProfileWork("https://www.douyin.com/video/1", "", "视频", "1", "博主", "正文", work_type="video", video_url="https://video.example/clean.mp4")
+    worker = main.BatchWorker([work], tmp_path, CollectionOptions(text=False, images=False, video=True))
+    completed = []
+    worker.succeeded.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0][1:4] == (1, 0, 0)
+    assert captured[0].video_url == "https://video.example/clean.mp4"
+
+
+def test_batch_worker_fetches_detail_when_requested_video_source_is_missing(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_video(self, url, progress=None):
+            calls.append(url)
+            return VideoInfo("博主", "视频", "正文", url, "1", work_type="video", video_url="https://video.example/clean.mp4")
+
+    def fake_save(info, root, options, overwrite=False, progress=None):
+        folder = Path(root) / info.author
+        folder.mkdir(parents=True)
+        work_dir = folder / "视频__1"
+        work_dir.mkdir()
+        return SelectedSaveResult(folder, work_dir, AssetState(), AssetState(video=True), False, MediaSaveResult(), "2026-09-04", video_saved=True, video_newly_saved=True)
+
+    monkeypatch.setattr(main, "DouyinSession", FakeSession)
+    monkeypatch.setattr(main, "save_selected_assets", fake_save)
+    work = ProfileWork("https://www.douyin.com/video/1", "", "视频", "1", "博主", "正文", work_type="video")
+    worker = main.BatchWorker([work], tmp_path, CollectionOptions(text=False, images=False, video=True))
+    worker.run()
+
+    assert calls == [work.url]

@@ -36,22 +36,24 @@ class MediaSaveResult:
 class CollectionOptions:
     text: bool = True
     images: bool = True
+    video: bool = False
 
     def __post_init__(self) -> None:
-        if not self.text and not self.images:
-            raise StorageError("至少选择文案或图片其中一项")
+        if not self.text and not self.images and not self.video:
+            raise StorageError("至少选择文案、图片或视频其中一项")
 
 
 @dataclass(frozen=True)
 class AssetState:
     text: bool = False
     images: bool = False
+    video: bool = False
 
-    def is_complete_for(self, options: CollectionOptions) -> bool:
-        return (not options.text or self.text) and (not options.images or self.images)
+    def is_complete_for(self, options: CollectionOptions, *, video_applicable: bool = True) -> bool:
+        return (not options.text or self.text) and (not options.images or self.images) and (not options.video or not video_applicable or self.video)
 
-    def has_requested_asset(self, options: CollectionOptions) -> bool:
-        return (options.text and self.text) or (options.images and self.images)
+    def has_requested_asset(self, options: CollectionOptions, *, video_applicable: bool = True) -> bool:
+        return (options.text and self.text) or (options.images and self.images) or (options.video and video_applicable and self.video)
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,8 @@ class SelectedSaveResult:
     text_saved: bool
     media: MediaSaveResult
     collected_at: str
+    video_saved: bool = False
+    video_newly_saved: bool = False
 
 
 def safe_filename(value: str, fallback: str, max_length: int = 100) -> str:
@@ -176,7 +180,8 @@ def get_asset_state(info: VideoInfo, output_root: str | Path = "output") -> Asse
         images = bool(expected and len(managed) >= expected and _cover_path(work_dir) is not None)
     else:
         images = _cover_path(work_dir) is not None
-    return AssetState(text=text, images=images)
+    video = _video_path(work_dir) is not None
+    return AssetState(text=text, images=images, video=video)
 
 
 def save_selected_assets(
@@ -190,6 +195,8 @@ def save_selected_assets(
     """Save only requested resources and merge their real state into JSONL."""
 
     info, author_dir, work_dir = _work_paths(info, output_root)
+    if info.work_type == "image" and options.video and not options.text and not options.images:
+        raise StorageError("该作品为图文作品，没有可采集的视频")
     author_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
     before = get_asset_state(info, output_root)
@@ -204,23 +211,27 @@ def save_selected_assets(
     elif options.images:
         media = _existing_media_result(info, work_dir)
 
+    video_newly_saved = False
+    if options.video and info.work_type == "video" and (overwrite or not before.video):
+        video_newly_saved = save_original_video(info, work_dir, progress=progress)
+
     after = get_asset_state(info, output_root)
     collected_at = datetime.now().astimezone().isoformat(timespec="seconds")
     _upsert_selected_record(author_dir, info, after, collected_at, text_saved=text_saved)
-    return SelectedSaveResult(author_dir.resolve(), work_dir.resolve(), before, after, text_saved, media, collected_at)
+    return SelectedSaveResult(author_dir.resolve(), work_dir.resolve(), before, after, text_saved, media, collected_at, video_saved=after.video, video_newly_saved=video_newly_saved)
 
 
 def _upsert_selected_record(author_dir: Path, info: VideoInfo, state: AssetState, collected_at: str, *, text_saved: bool) -> None:
     old = next((record for record in _records(author_dir) if aweme_id_from_record(record) == info.aweme_id), {})
     record = dict(old)
     current = asdict(info)
-    for key in ("aweme_id", "author", "title", "url", "work_type", "cover_url", "image_urls", "image_total"):
+    for key in ("aweme_id", "author", "title", "url", "work_type", "cover_url", "image_urls", "image_total", "video_url", "video_urls"):
         record[key] = current[key]
     if text_saved:
         record["content"] = info.content
     elif "content" not in old:
         record.pop("content", None)
-    record["saved_assets"] = {"text": state.text, "images": state.images}
+    record["saved_assets"] = {"text": state.text, "images": state.images, "video": state.video}
     record["collected_at"] = collected_at
     upsert_jsonl(author_dir, record)
 
@@ -271,6 +282,8 @@ def save_video(
     collected_at = datetime.now().astimezone().isoformat(timespec="seconds")
     content_path.write_text(info.content + "\n", encoding="utf-8", newline="\n")
     record = asdict(info)
+    state = get_asset_state(info, output_root)
+    record["saved_assets"] = {"text": state.text, "images": state.images, "video": state.video}
     record["collected_at"] = collected_at
     upsert_jsonl(author_dir, record)
     return author_dir.resolve(), content_path.resolve(), collected_at
@@ -331,6 +344,31 @@ def save_media(
     return MediaSaveResult()
 
 
+def save_original_video(
+    info: VideoInfo,
+    work_dir: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> bool:
+    """Save one clean original playback stream without touching other assets."""
+
+    if info.work_type != "video":
+        return False
+    candidates = tuple(dict.fromkeys((info.video_url, *info.video_urls)))
+    candidates = tuple(url for url in candidates if url.startswith(("https://", "http://")))
+    if not candidates:
+        return False
+    report = progress or (lambda _message: None)
+    for url in candidates:
+        report("下载原视频")
+        try:
+            _download_video_to_path(url, work_dir / "video.mp4")
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _clear_managed_media(work_dir: Path) -> None:
     for path in work_dir.glob("cover.*"):
         if path.is_file():
@@ -346,6 +384,11 @@ def _managed_image_path(image_dir: Path, index: int) -> Path | None:
 
 def _cover_path(work_dir: Path) -> Path | None:
     return next((path for path in work_dir.glob("cover.*") if path.is_file()), None)
+
+
+def _video_path(work_dir: Path) -> Path | None:
+    path = work_dir / "video.mp4"
+    return path if path.is_file() and path.stat().st_size > 0 else None
 
 
 def _existing_media_result(info: VideoInfo, work_dir: Path) -> MediaSaveResult:
@@ -379,6 +422,28 @@ def _download_to_stem(url: str, stem: Path) -> Path:
                 shutil.copyfileobj(response, handle)
         temporary_path.replace(destination)
         return destination
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
+
+def _download_video_to_path(url: str, destination: Path) -> None:
+    """Download to a part file, then atomically replace only a complete video."""
+
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"})
+    temporary_path: Path | None = None
+    try:
+        with urlopen(request, timeout=30) as response:
+            content_type = (response.headers.get_content_type() or "").lower()
+            if content_type and content_type != "application/octet-stream" and not content_type.startswith("video/"):
+                raise StorageError("视频地址返回的不是视频内容")
+            with tempfile.NamedTemporaryFile(delete=False, dir=destination.parent, suffix=".part") as handle:
+                temporary_path = Path(handle.name)
+                shutil.copyfileobj(response, handle)
+        if temporary_path.stat().st_size <= 0:
+            raise StorageError("视频下载内容为空")
+        temporary_path.replace(destination)
     except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()

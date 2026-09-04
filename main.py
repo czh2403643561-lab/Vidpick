@@ -36,14 +36,14 @@ class SettingsDialog(QDialog):
     def __init__(self, options: CollectionOptions, parent=None) -> None:
         super().__init__(parent); self.setWindowTitle("采集内容设置"); self.setMinimumWidth(300)
         root = QVBoxLayout(self); group = QGroupBox("采集内容"); layout = QVBoxLayout(group)
-        self.text = QCheckBox("文案（content.txt）"); self.images = QCheckBox("图片（图文图片与封面 / 视频封面）")
-        self.text.setChecked(options.text); self.images.setChecked(options.images); layout.addWidget(self.text); layout.addWidget(self.images); root.addWidget(group)
+        self.text = QCheckBox("文案（content.txt）"); self.images = QCheckBox("图片/封面（图文图片与封面 / 视频封面）"); self.video = QCheckBox("视频（原视频文件）")
+        self.text.setChecked(options.text); self.images.setChecked(options.images); self.video.setChecked(options.video); layout.addWidget(self.text); layout.addWidget(self.images); layout.addWidget(self.video); root.addWidget(group)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok); self.buttons.button(QDialogButtonBox.Ok).setText("保存设置"); self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); root.addWidget(self.buttons)
-        self.text.stateChanged.connect(self._update_accept); self.images.stateChanged.connect(self._update_accept); self._update_accept()
+        self.text.stateChanged.connect(self._update_accept); self.images.stateChanged.connect(self._update_accept); self.video.stateChanged.connect(self._update_accept); self._update_accept()
     def _update_accept(self) -> None:
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(self.text.isChecked() or self.images.isChecked())
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(self.text.isChecked() or self.images.isChecked() or self.video.isChecked())
     def options(self) -> CollectionOptions:
-        return CollectionOptions(text=self.text.isChecked(), images=self.images.isChecked())
+        return CollectionOptions(text=self.text.isChecked(), images=self.images.isChecked(), video=self.video.isChecked())
 
 
 class RecognitionWorker(QObject):
@@ -65,7 +65,7 @@ class SaveWorker(QObject):
             self.progress.emit(35, "准备保存所选内容")
             result = save_selected_assets(self.info, self.output_root, self.options, overwrite=self.overwrite, progress=lambda step: self.progress.emit(60, step))
             self.progress.emit(90, "整理保存结果")
-            self.succeeded.emit((result, media))
+            self.succeeded.emit(result)
         except Exception as exc: self.failed.emit(str(exc) or "保存失败，请检查输出目录权限")
         finally: self.finished.emit()
 
@@ -81,12 +81,18 @@ class BatchWorker(QObject):
             for index, work in enumerate(self.works, 1):
                     self.progress.emit(index, total, work.title, "准备保存")
                     try:
-                        if _profile_work_has_complete_media(work, self.options):
-                            info = _profile_work_info(work)
+                        profile_info = _profile_work_info(work)
+                        existing = get_asset_state(profile_info, self.output_root) if work.aweme_id else AssetState()
+                        needs_save = not work.aweme_id or work.aweme_id in self.overwrite_ids or not _state_is_complete_for_work(existing, work, self.options)
+                        if not needs_save or _profile_work_has_complete_media(work, self.options):
+                            info = profile_info
                             self.progress.emit(index, total, work.title, "使用主页作品数据")
                         else:
                             if session is None: session = DouyinSession().__enter__()
                             info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
+                        if _is_video_only_image(info, self.options):
+                            skipped += 1
+                            continue
                         result = save_selected_assets(info, self.output_root, self.options, overwrite=work.aweme_id in self.overwrite_ids, progress=lambda step: self.progress.emit(index, total, work.title, step))
                         output_dir = result.author_dir
                         success += 1; self.log.emit(_batch_save_message(index, total, work.title, info, result, self.options))
@@ -108,7 +114,10 @@ class WorksSelectionDialog(QDialog):
         for i, work in enumerate(self.profile.works):
             card = QGroupBox(); layout = QVBoxLayout(card); image = QLabel("封面加载中"); image.setAlignment(Qt.AlignCenter); image.setFixedSize(170, 150); image.setStyleSheet("background:#eef1f5;border-radius:8px;color:#858995;"); layout.addWidget(image, alignment=Qt.AlignCenter)
             state = _profile_work_asset_state(work, output_root, self.options)
-            state_text = "已完整" if state.is_complete_for(self.options) else "待补齐" if state.has_requested_asset(self.options) else ""
+            if _is_video_only_image(work, self.options):
+                state_text = "不适用"
+            else:
+                state_text = "已完整" if _state_is_complete_for_work(state, work, self.options) else "待补齐" if _state_has_requested_asset_for_work(state, work, self.options) else ""
             title_text = _short(work.title, 36) + (f"\n{state_text}" if state_text else "")
             title = QLabel(title_text); title.setWordWrap(True); title.setFixedHeight(42); layout.addWidget(title); check = QCheckBox("选择"); check.stateChanged.connect(self._update_count); layout.addWidget(check); self.checks.append(check)
             if work.cover_url: self._load_cover(work.cover_url, image)
@@ -135,8 +144,8 @@ class MainWindow(QMainWindow):
     def _build(self) -> None:
         self.setWindowTitle("Vidpick"); self.resize(980, 760); self.setMinimumSize(820, 650); central = QWidget(); central.setObjectName("central_widget"); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
         header = QHBoxLayout(); header.setSpacing(10); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch()
-        self.collection_status = QWidget(); self.collection_status.setObjectName("collection_status"); self.collection_status.setFixedSize(122, 48); status_layout = QVBoxLayout(self.collection_status); status_layout.setContentsMargins(9, 4, 9, 4); status_layout.setSpacing(0)
-        for label_text, attribute in (("文案", "collection_text_state"), ("图片/封面", "collection_images_state")):
+        self.collection_status = QWidget(); self.collection_status.setObjectName("collection_status"); self.collection_status.setFixedSize(122, 66); status_layout = QVBoxLayout(self.collection_status); status_layout.setContentsMargins(9, 4, 9, 4); status_layout.setSpacing(0)
+        for label_text, attribute in (("文案", "collection_text_state"), ("图片/封面", "collection_images_state"), ("视频", "collection_video_state")):
             status_row = QHBoxLayout(); status_row.setContentsMargins(0, 0, 0, 0); status_row.setSpacing(4); label = QLabel(label_text); label.setObjectName("collection_status_label"); value = QLabel(); value.setObjectName("collection_status_value"); setattr(self, attribute, value); status_row.addWidget(label); status_row.addStretch(); status_row.addWidget(value); status_layout.addLayout(status_row)
         header.addWidget(self.collection_status); self.settings_button = QPushButton(); self.settings_button.setObjectName("utility"); self.settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH))); self.settings_button.setIconSize(QSize(20, 20)); self.settings_button.setToolTip("采集内容设置"); self.settings_button.clicked.connect(self._edit_settings); header.addWidget(self.settings_button)
         mode_container = QWidget(); mode_container.setObjectName("mode_container"); mode_container.setFixedWidth(300); mode_layout = QHBoxLayout(mode_container); mode_layout.setContentsMargins(4, 4, 4, 4); mode_layout.setSpacing(3); self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True); self.mode_buttons: dict[str, QPushButton] = {}
@@ -192,6 +201,7 @@ class MainWindow(QMainWindow):
     def _refresh_collection_status(self) -> None:
         self.collection_text_state.setText("✓" if self.options.text else "未选")
         self.collection_images_state.setText("✓" if self.options.images else "未选")
+        self.collection_video_state.setText("✓" if self.options.video else "未选")
     def _work_type_text(self, info: VideoInfo) -> str:
         if info.work_type != "image":
             return "视频"
@@ -220,7 +230,9 @@ class MainWindow(QMainWindow):
         if self.single:
             state = get_asset_state(self.single, root)
             overwrite = False
-            if state.is_complete_for(self.options):
+            if _is_video_only_image(self.single, self.options):
+                self.status.setText("不适用"); self.step.setText("该作品为图文作品，没有可采集的视频。"); return
+            if _state_is_complete_for_work(state, self.single, self.options):
                 box = QMessageBox(QMessageBox.Warning, "重复作品", "这个作品所选内容已经采集过。", parent=self)
                 overwrite_button = box.addButton("覆盖所选内容", QMessageBox.AcceptRole)
                 box.addButton("取消任务", QMessageBox.RejectRole)
@@ -231,11 +243,15 @@ class MainWindow(QMainWindow):
             self._run(SaveWorker(self.single, root, self.options, overwrite=overwrite))
             return
         if not self.selected: return
-        states = {work.aweme_id: _profile_work_asset_state(work, root, self.options) for work in self.selected}
-        complete = [work for work in self.selected if states[work.aweme_id].is_complete_for(self.options)]
-        partial = [work for work in self.selected if not states[work.aweme_id].is_complete_for(self.options) and states[work.aweme_id].has_requested_asset(self.options)]
-        new = [work for work in self.selected if not states[work.aweme_id].has_requested_asset(self.options)]
-        overwrite_ids: set[str] = set(); skipped = 0; works = self.selected
+        not_applicable = [work for work in self.selected if _is_video_only_image(work, self.options)]
+        applicable = [work for work in self.selected if work not in not_applicable]
+        if not applicable:
+            self.step.setText("所选图文作品没有可采集的视频。"); return
+        states = {work.aweme_id: _profile_work_asset_state(work, root, self.options) for work in applicable}
+        complete = [work for work in applicable if _state_is_complete_for_work(states[work.aweme_id], work, self.options)]
+        partial = [work for work in applicable if not _state_is_complete_for_work(states[work.aweme_id], work, self.options) and _state_has_requested_asset_for_work(states[work.aweme_id], work, self.options)]
+        new = [work for work in applicable if not _state_has_requested_asset_for_work(states[work.aweme_id], work, self.options)]
+        overwrite_ids: set[str] = set(); skipped = len(not_applicable); works = applicable
         if complete:
             message = f"已选择 {len(self.selected)} 个作品：\n需要新采集 {len(new)} 个\n需要补齐 {len(partial)} 个\n所选内容已完整 {len(complete)} 个"
             box = QMessageBox(QMessageBox.Warning, "发现已完整作品", message, parent=self)
@@ -245,7 +261,7 @@ class MainWindow(QMainWindow):
             box.setDefaultButton(skip_button)
             box.exec()
             if box.clickedButton() is skip_button:
-                complete_ids = {work.aweme_id for work in complete}; works = [work for work in self.selected if work.aweme_id not in complete_ids]; skipped = len(complete)
+                complete_ids = {work.aweme_id for work in complete}; works = [work for work in applicable if work.aweme_id not in complete_ids]; skipped += len(complete)
             elif box.clickedButton() is overwrite_button:
                 overwrite_ids = {work.aweme_id for work in complete}
             else:
@@ -301,24 +317,40 @@ def _short(value: str, size: int) -> str: return value[:size] + ("…" if len(va
 def _card_title(text: str) -> QLabel:
     label = QLabel(text); label.setObjectName("card_title"); label.setFixedHeight(20); label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); return label
 def _load_collection_options(settings: QSettings) -> CollectionOptions:
-    text = settings.value("collect_text", True, type=bool); images = settings.value("collect_images", True, type=bool)
-    return CollectionOptions(text=text, images=images) if text or images else CollectionOptions()
+    text = settings.value("collect_text", True, type=bool); images = settings.value("collect_images", True, type=bool); video = settings.value("collect_video", False, type=bool)
+    return CollectionOptions(text=text, images=images, video=video) if text or images or video else CollectionOptions()
 def _save_collection_options(settings: QSettings, options: CollectionOptions) -> None:
-    settings.setValue("collect_text", options.text); settings.setValue("collect_images", options.images); settings.sync()
+    settings.setValue("collect_text", options.text); settings.setValue("collect_images", options.images); settings.setValue("collect_video", options.video); settings.sync()
 def _profile_work_info(work: ProfileWork) -> VideoInfo:
-    return VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id, work.work_type or "video", work.cover_url, work.image_urls, work.image_total)
+    return VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id, work.work_type or "video", work.cover_url, work.image_urls, work.image_total, work.video_url, work.video_urls)
+def _video_is_applicable(work: VideoInfo | ProfileWork, options: CollectionOptions) -> bool:
+    return options.video and work.work_type != "image"
+def _is_video_only_image(work: VideoInfo | ProfileWork, options: CollectionOptions) -> bool:
+    return work.work_type == "image" and options.video and not options.text and not options.images
+def _state_is_complete_for_work(state: AssetState, work: VideoInfo | ProfileWork, options: CollectionOptions) -> bool:
+    return state.is_complete_for(options, video_applicable=_video_is_applicable(work, options))
+def _state_has_requested_asset_for_work(state: AssetState, work: VideoInfo | ProfileWork, options: CollectionOptions) -> bool:
+    return state.has_requested_asset(options, video_applicable=_video_is_applicable(work, options))
 def _profile_work_has_complete_media(work: ProfileWork, options: CollectionOptions) -> bool:
     if options.text and not work.desc:
         return False
-    if not options.images:
-        return True
-    if work.work_type == "image":
-        return bool(work.image_total and len(work.image_urls) == work.image_total and work.cover_url == work.image_urls[0])
-    return work.work_type == "video" and bool(work.cover_url)
+    if options.images:
+        if work.work_type == "image":
+            if not (work.image_total and len(work.image_urls) == work.image_total and work.cover_url == work.image_urls[0]):
+                return False
+        elif work.work_type != "video" or not work.cover_url:
+            return False
+    if _video_is_applicable(work, options) and not work.video_url:
+        return False
+    return True
 def _profile_work_asset_state(work: ProfileWork, output_root: Path, options: CollectionOptions) -> AssetState:
     state = get_asset_state(_profile_work_info(work), output_root)
     media_options = CollectionOptions(text=False, images=True)
-    return AssetState(state.text, False) if options.images and not _profile_work_has_complete_media(work, media_options) else state
+    if options.images and not state.images and not _profile_work_has_complete_media(work, media_options):
+        return AssetState(state.text, False, state.video)
+    if _video_is_applicable(work, options) and not state.video and not work.video_url:
+        return AssetState(state.text, state.images, False)
+    return state
 def _image_phrase(info: VideoInfo, saved: SelectedSaveResult) -> tuple[bool, str]:
     media = saved.media
     if info.work_type == "image":
@@ -334,22 +366,35 @@ def _selected_save_message(title: str, info: VideoInfo | None, saved: SelectedSa
     if info is None:
         return f"保存成功：{title}"
     complete_media, image_phrase = _image_phrase(info, saved)
-    topping_up = saved.before.has_requested_asset(options) and not saved.before.is_complete_for(options)
+    video_requested = _video_is_applicable(info, options)
+    video_complete = not video_requested or saved.after.video
+    topping_up = _state_has_requested_asset_for_work(saved.before, info, options) and not _state_is_complete_for_work(saved.before, info, options)
     if topping_up:
         additions = []
         if options.text and not saved.before.text and saved.after.text:
             additions.append("新增文案")
         if options.images and not saved.before.images:
             additions.append(f"新增 {saved.media.newly_saved} 张图片" if info.work_type == "image" and complete_media else image_phrase)
+        if video_requested and not saved.before.video:
+            additions.append("新增视频" if saved.after.video else "视频下载失败")
         return f"补齐完成：{title} · {' + '.join(additions) or '所选内容'}"
     if options.images and not complete_media:
         text_part = "文案成功，" if options.text and saved.after.text else ""
         return f"保存完成：{title} · {text_part}{image_phrase}"
+    if not video_complete:
+        parts = []
+        if options.text and saved.after.text:
+            parts.append("文案成功")
+        if options.images and complete_media:
+            parts.append(image_phrase)
+        return f"保存完成：{title} · {' + '.join(parts + ['视频下载失败'])}"
     parts = []
     if options.text and saved.after.text:
         parts.append("文案")
     if options.images:
         parts.append(image_phrase)
+    if video_requested:
+        parts.append("视频")
     return f"保存成功：{title} · {' + '.join(parts)}"
 def _batch_save_message(index: int, total: int, title: str, info: VideoInfo, saved: SelectedSaveResult, options: CollectionOptions) -> str:
     message = _selected_save_message(title, info, saved, options)

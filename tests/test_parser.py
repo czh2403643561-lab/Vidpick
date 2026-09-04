@@ -75,11 +75,15 @@ def test_profile_cards_keep_structured_fields() -> None:
         "cover_url": "https://clean.example/01.webp",
         "image_urls": ("https://clean.example/01.webp", "https://clean.example/02.webp"),
         "image_total": 2,
+        "video_url": "https://video.example/clean.mp4",
+        "video_urls": ("https://video.example/clean.mp4",),
     }])[0]
     assert (work.aweme_id, work.author, work.desc, work.work_type, work.cover_url, work.image_urls, work.image_total) == (
         "123", "博主", "完整正文", "image", "https://clean.example/01.webp",
         ("https://clean.example/01.webp", "https://clean.example/02.webp"), 2,
     )
+    assert work.video_url == ""
+    assert work.video_urls == ()
 
 
 def test_structured_profile_aweme_keeps_clean_image_media() -> None:
@@ -199,10 +203,38 @@ def test_target_aweme_video_uses_its_own_cover_without_images() -> None:
         "aweme_id": "456",
         "desc": "视频作品",
         "author": {"nickname": "测试博主"},
-        "video": {"origin_cover": {"url_list": ["https://cover/original.jpg"]}},
+        "video": {
+            "origin_cover": {"url_list": ["https://cover/original.jpg"]},
+            "bit_rate": [
+                {"format": "mp4", "is_h265": 1, "is_bytevc1": 0, "bit_rate": 9_000, "play_addr": {"width": 1920, "height": 1080, "url_list": ["https://video.example/h265.mp4"]}},
+                {"format": "mp4", "is_h265": 0, "is_bytevc1": 0, "bit_rate": 1_000, "play_addr": {"width": 720, "height": 1280, "url_list": ["https://video.example/h264-low.mp4"]}},
+                {"format": "mp4", "is_h265": 0, "is_bytevc1": 0, "bit_rate": 2_000, "play_addr": {"width": 1080, "height": 1920, "url_list": ["https://video.example/h264-high.mp4"]}},
+            ],
+            "download_addr": {"url_list": ["https://watermark.example/download.mp4"]},
+        },
     }, "https://www.douyin.com/video/456")
 
     assert (info.work_type, info.cover_url, info.image_urls, info.image_total) == ("video", "https://cover/original.jpg", (), 0)
+    assert info.video_url == "https://video.example/h264-high.mp4"
+    assert info.video_urls[0] == info.video_url
+    assert all("watermark" not in url for url in info.video_urls)
+
+
+def test_structured_profile_video_keeps_clean_playback_source() -> None:
+    works = _works_from_awemes([{
+        "aweme_id": "456",
+        "desc": "视频正文",
+        "author": {"nickname": "测试博主"},
+        "video": {
+            "cover": {"url_list": ["https://cover/video.jpg"]},
+            "bit_rate": [{"format": "mp4", "is_h265": 0, "is_bytevc1": 0, "bit_rate": 1_000, "play_addr": {"width": 720, "height": 1280, "url_list": ["https://video.example/clean.mp4"]}}],
+            "download_addr": {"url_list": ["https://watermark.example/download.mp4"]},
+        },
+    }])
+
+    assert works[0].work_type == "video"
+    assert works[0].video_url == "https://video.example/clean.mp4"
+    assert works[0].video_urls == ("https://video.example/clean.mp4",)
 
 
 def test_target_html_fails_closed_when_only_other_work_exists() -> None:
