@@ -6,7 +6,7 @@ import main
 from douyin_parser import ProfileWork, VideoInfo
 from storage import AssetState, CollectionOptions, MediaSaveResult, SelectedSaveResult
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication, QDialogButtonBox
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox
 
 
 def test_mode_logs_do_not_mix() -> None:
@@ -31,6 +31,47 @@ def test_collection_options_persist_and_settings_require_one_choice(tmp_path) ->
     dialog.text.setChecked(True)
     assert dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
     dialog.close()
+
+
+def test_collection_status_reflects_options_refreshes_and_survives_mode_switch(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    window.app_settings = QSettings(str(tmp_path / "window-settings.ini"), QSettings.IniFormat)
+
+    assert not window.collection_status.isHidden()
+    assert window.collection_text_state.text() == ("✓" if window.options.text else "未选")
+    assert window.collection_images_state.text() == ("✓" if window.options.images else "未选")
+
+    class FakeSettingsDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+        def options(self):
+            return CollectionOptions(text=False, images=True)
+
+    monkeypatch.setattr(main, "SettingsDialog", FakeSettingsDialog)
+    window._edit_settings()
+    assert window.collection_text_state.text() == "未选"
+    assert window.collection_images_state.text() == "✓"
+
+    window.mode_buttons["batch"].click()
+    window.mode_buttons["single"].click()
+    assert not window.collection_status.isHidden()
+    window.close()
+
+
+def test_result_fields_and_card_spacing_are_aligned() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+
+    assert {label.width() for label in window.result_field_labels} == {44}
+    assert [label.text() for label in window.result_field_labels] == ["状态", "博主", "作品", "类型", "详情"]
+    assert window.task_card.layout().contentsMargins().left() == 12
+    assert window.log_card.layout().contentsMargins().left() == 12
+    window.close()
 
 
 def test_recognize_does_not_start_a_second_worker_when_thread_exists(monkeypatch) -> None:
@@ -189,6 +230,7 @@ def test_single_preview_uses_the_same_clean_cover_url_as_image_data(monkeypatch)
 def test_single_save_log_reports_partial_image_download() -> None:
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
+    window.options = CollectionOptions()
     window.single = VideoInfo(
         "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
         work_type="image", image_urls=("https://image/1.webp", "https://image/2.webp"),
@@ -203,6 +245,7 @@ def test_single_save_log_reports_partial_image_download() -> None:
 def test_single_save_log_marks_risky_only_image_source_as_unavailable() -> None:
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
+    window.options = CollectionOptions()
     window.single = VideoInfo(
         "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
         work_type="image", image_total=1,
