@@ -364,6 +364,54 @@ def test_video_only_rejects_image_work_without_starting_task(monkeypatch) -> Non
     window.close()
 
 
+def test_batch_recognition_shows_star_and_refreshes_favorite_data(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    favorites_path = tmp_path / "favorites.json"
+    monkeypatch.setattr(main, "FAVORITES_PATH", favorites_path)
+    monkeypatch.setattr(main.MainWindow, "_choose_works", lambda _window: None)
+    window = main.MainWindow()
+    profile = main.ProfileInfo(
+        "测试博主", "https://www.douyin.com/user/test?vid=123",
+        (ProfileWork("https://www.douyin.com/video/1", "", "作品", "1", "测试博主"),),
+    )
+
+    window._recognized(profile)
+    assert not window.favorite_button.isHidden()
+    assert window.favorite_button.text() == "☆"
+
+    window.favorite_button.click()
+    assert window.favorite_button.text() == "★"
+    assert main.load_favorite_bloggers(favorites_path)[0]["author"] == "测试博主"
+
+    window._recognized(profile)
+    assert window.favorite_button.text() == "★"
+    assert main.load_favorite_bloggers(favorites_path)[0]["last_seen_aweme_ids"] == ["1"]
+
+    window.favorite_button.click()
+    assert main.load_favorite_bloggers(favorites_path) == []
+    window.close()
+
+
+def test_favorites_entry_views_profile_in_batch_mode(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+
+    class FakeFavoritesDialog:
+        def __init__(self, *_args, **_kwargs):
+            self.view_profile_url = "https://www.douyin.com/user/test"
+
+        def exec(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(main, "FavoritesDialog", FakeFavoritesDialog)
+    window.favorites_entry.click()
+
+    assert window.current_mode == "batch"
+    assert window.url.text() == "https://www.douyin.com/user/test"
+    assert window.mode_buttons["batch"].isChecked()
+    window.close()
+
+
 @pytest.mark.parametrize("choice, expected_ids, overwrite, skipped", [
     ("skip", ["2"], False, 1),
     ("overwrite", ["1", "2"], True, 0),

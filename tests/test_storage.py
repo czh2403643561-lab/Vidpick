@@ -4,7 +4,7 @@ import pytest
 
 from douyin_parser import VideoInfo
 import storage
-from storage import AlreadyCollectedError, AssetState, CollectionOptions, get_asset_state, get_author_dir, get_work_dir, is_collected, save_media, save_selected_assets, save_video, safe_filename
+from storage import AlreadyCollectedError, AssetState, CollectionOptions, get_asset_state, get_author_dir, get_work_dir, is_collected, is_favorite_blogger, load_favorite_bloggers, remove_favorite_blogger, save_media, save_selected_assets, save_video, safe_filename, upsert_favorite_blogger
 
 
 def test_safe_filename_handles_windows_names() -> None:
@@ -356,3 +356,23 @@ def test_video_only_rejects_image_without_creating_a_work_directory(tmp_path) ->
         save_selected_assets(info, tmp_path, CollectionOptions(text=False, images=False, video=True))
 
     assert not (tmp_path / "测试博主").exists()
+
+
+def test_favorite_bloggers_persist_refresh_and_remove(tmp_path) -> None:
+    path = tmp_path / "favorites.json"
+    profile_url = "https://www.douyin.com/user/test?from_tab_name=main&vid=123"
+
+    first = upsert_favorite_blogger("测试博主", profile_url, ["1", "2", "2"], "2026-09-04T18:00:00+08:00", path)
+    assert first["profile_url"] == "https://www.douyin.com/user/test"
+    assert first["last_seen_aweme_ids"] == ["1", "2"]
+    assert is_favorite_blogger("https://www.douyin.com/user/test?vid=999", path)
+
+    upsert_favorite_blogger("更新后的博主", "https://www.douyin.com/user/test", ["3"], "2026-09-04T19:00:00+08:00", path)
+    favorites = load_favorite_bloggers(path)
+    assert len(favorites) == 1
+    assert favorites[0]["author"] == "更新后的博主"
+    assert favorites[0]["last_seen_aweme_ids"] == ["3"]
+
+    assert remove_favorite_blogger("https://www.douyin.com/user/test?vid=1", path)
+    assert load_favorite_bloggers(path) == []
+    assert not remove_favorite_blogger("https://www.douyin.com/user/test", path)

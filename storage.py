@@ -10,7 +10,7 @@ import re
 import shutil
 import tempfile
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 from urllib.request import Request, urlopen
 
 from douyin_parser import VideoInfo, extract_target_aweme_id
@@ -22,6 +22,9 @@ class StorageError(RuntimeError):
 
 class AlreadyCollectedError(StorageError):
     """Raised when a new save would overwrite an existing work."""
+
+
+FAVORITES_PATH = Path(__file__).resolve().parent / "favorites.json"
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,104 @@ def is_collected(author: str, aweme_id: str, output_root: str | Path = "output")
 
     target = str(aweme_id).strip()
     return bool(target and target in get_collected_aweme_ids(author, output_root))
+
+
+def _favorite_path(path: str | Path | None) -> Path:
+    return Path(path) if path is not None else FAVORITES_PATH
+
+
+def _favorite_profile_url(url: str) -> str:
+    """Keep one favorite per profile, even when a profile link includes a work query."""
+
+    value = str(url or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc and parsed.path:
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/", "", ""))
+    return value
+
+
+def load_favorite_bloggers(path: str | Path | None = None) -> list[dict[str, Any]]:
+    """Load the small local favorite-blogger list, tolerating a missing or invalid file."""
+
+    favorite_path = _favorite_path(path)
+    if not favorite_path.is_file():
+        return []
+    try:
+        value = json.loads(favorite_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    favorites: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        author = str(item.get("author", "")).strip()
+        profile_url = _favorite_profile_url(str(item.get("profile_url", "")))
+        if not author or not profile_url:
+            continue
+        ids = item.get("last_seen_aweme_ids", [])
+        if not isinstance(ids, list):
+            ids = []
+        favorites.append({
+            "author": author,
+            "profile_url": profile_url,
+            "last_checked_at": str(item.get("last_checked_at", "")).strip(),
+            "last_seen_aweme_ids": list(dict.fromkeys(str(value).strip() for value in ids if str(value).strip())),
+        })
+    return favorites
+
+
+def save_favorite_bloggers(favorites: list[dict[str, Any]], path: str | Path | None = None) -> None:
+    """Persist favorite bloggers as a readable JSON array beside the application."""
+
+    favorite_path = _favorite_path(path)
+    favorite_path.parent.mkdir(parents=True, exist_ok=True)
+    favorite_path.write_text(json.dumps(favorites, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def is_favorite_blogger(profile_url: str, path: str | Path | None = None) -> bool:
+    key = _favorite_profile_url(profile_url)
+    return bool(key and any(_favorite_profile_url(item["profile_url"]) == key for item in load_favorite_bloggers(path)))
+
+
+def upsert_favorite_blogger(
+    author: str,
+    profile_url: str,
+    last_seen_aweme_ids: list[str],
+    last_checked_at: str | None = None,
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Add or refresh one favorite blogger after a successful profile recognition."""
+
+    normalized_url = _favorite_profile_url(profile_url)
+    if not str(author).strip() or not normalized_url:
+        raise StorageError("收藏博主缺少名称或主页链接")
+    favorites = load_favorite_bloggers(path)
+    current = next((item for item in favorites if _favorite_profile_url(item["profile_url"]) == normalized_url), None)
+    record = {
+        "author": str(author).strip(),
+        "profile_url": normalized_url,
+        "last_checked_at": last_checked_at or datetime.now().astimezone().isoformat(timespec="seconds"),
+        "last_seen_aweme_ids": list(dict.fromkeys(str(value).strip() for value in last_seen_aweme_ids if str(value).strip())),
+    }
+    if current is None:
+        favorites.append(record)
+    else:
+        current.update(record)
+        record = current
+    save_favorite_bloggers(favorites, path)
+    return record
+
+
+def remove_favorite_blogger(profile_url: str, path: str | Path | None = None) -> bool:
+    key = _favorite_profile_url(profile_url)
+    favorites = load_favorite_bloggers(path)
+    remaining = [item for item in favorites if _favorite_profile_url(item["profile_url"]) != key]
+    if len(remaining) == len(favorites):
+        return False
+    save_favorite_bloggers(remaining, path)
+    return True
 
 
 def _find_work_dir(author_dir: Path, aweme_id: str) -> Path | None:
