@@ -377,18 +377,44 @@ def test_batch_recognition_shows_star_and_refreshes_favorite_data(tmp_path, monk
 
     window._recognized(profile)
     assert not window.favorite_button.isHidden()
-    assert window.favorite_button.text() == "☆"
+    assert not window.favorite_button.icon().isNull()
+    assert window.favorite_button.property("favorite") is False
 
     window.favorite_button.click()
-    assert window.favorite_button.text() == "★"
+    assert not window.favorite_button.icon().isNull()
+    assert window.favorite_button.property("favorite") is True
     assert main.load_favorite_bloggers(favorites_path)[0]["author"] == "测试博主"
 
     window._recognized(profile)
-    assert window.favorite_button.text() == "★"
+    assert window.favorite_button.property("favorite") is True
     assert main.load_favorite_bloggers(favorites_path)[0]["last_seen_aweme_ids"] == ["1"]
 
     window.favorite_button.click()
     assert main.load_favorite_bloggers(favorites_path) == []
+    window.close()
+
+
+def test_header_icons_are_complete_sized_and_output_shortcut_opens_folder(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    output_root = tmp_path / "output"
+    opened = []
+    monkeypatch.setattr(main, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(main.QDesktopServices, "openUrl", staticmethod(lambda url: opened.append(url) or True))
+    window = main.MainWindow()
+
+    assert not window.favorites_entry.icon().isNull()
+    assert not window.output_button.icon().isNull()
+    assert window.favorites_entry.size().toTuple() == (38, 38)
+    assert window.favorites_entry.iconSize().toTuple() == (20, 20)
+    assert window.favorites_entry.icon().actualSize(window.favorites_entry.iconSize()).toTuple() == (20, 20)
+    assert window.favorite_button.iconSize().toTuple() == (20, 20)
+    assert window.output_button.iconSize().toTuple() == (20, 20)
+
+    window.output_button.click()
+
+    assert output_root.is_dir()
+    assert len(opened) == 1
+    assert Path(opened[0].toLocalFile()) == output_root
     window.close()
 
 
