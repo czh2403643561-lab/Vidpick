@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import time
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QSize, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QButtonGroup, QScrollArea, QVBoxLayout, QWidget
@@ -17,6 +17,7 @@ from storage import get_collected_aweme_ids, is_collected, save_media, save_vide
 
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "vidpick-icon.ico"
+PASTE_ICON_PATH = Path(__file__).resolve().parent / "assets" / "paste.svg"
 
 
 class ModeLogStore:
@@ -119,7 +120,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__(); self.setWindowIcon(QIcon(str(ICON_PATH))); self.current_mode = "single"; self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.preview_manager = QNetworkAccessManager(self); self.preview_reply = None; self.mode_logs = ModeLogStore(); self._build(); self._style()
     def _build(self) -> None:
-        self.setWindowTitle("Vidpick"); self.resize(980, 760); self.setMinimumSize(820, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
+        self.setWindowTitle("Vidpick"); self.resize(980, 760); self.setMinimumSize(820, 650); central = QWidget(); central.setObjectName("central_widget"); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
         header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch()
         mode_container = QWidget(); mode_container.setObjectName("mode_container"); mode_container.setFixedWidth(300); mode_layout = QHBoxLayout(mode_container); mode_layout.setContentsMargins(4, 4, 4, 4); mode_layout.setSpacing(3); self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True); self.mode_buttons: dict[str, QPushButton] = {}
         for mode, label in (("single", "单个作品"), ("batch", "博主批量")):
@@ -127,14 +128,14 @@ class MainWindow(QMainWindow):
         header.addWidget(mode_container); root.addLayout(header)
 
         info_column = QWidget(); info_layout = QVBoxLayout(info_column); info_layout.setContentsMargins(0, 0, 0, 0); info_layout.setSpacing(14)
-        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴抖音网页版作品地址"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); info_layout.addWidget(link_group)
+        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴抖音网页版作品地址"); self.url.textChanged.connect(self._reset); self.paste_button = QPushButton(); self.paste_button.setObjectName("utility"); self.paste_button.setIcon(QIcon(str(PASTE_ICON_PATH))); self.paste_button.setIconSize(QSize(20, 20)); self.paste_button.setToolTip("粘贴剪贴板内容"); self.paste_button.setAccessibleName("粘贴剪贴板内容"); self.paste_button.clicked.connect(self._paste_clipboard); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.paste_button); row.addWidget(self.recognize); info_layout.addWidget(link_group)
         result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.work_type = QLabel("—"); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("类型", self.work_type); form.addRow("详情", self.detail); info_layout.addWidget(result)
         self.preview_card = QGroupBox("作品预览"); self.preview_card.setFixedWidth(230); preview_layout = QVBoxLayout(self.preview_card); self.preview_image = QLabel("暂无预览"); self.preview_image.setObjectName("preview_image"); self.preview_image.setAlignment(Qt.AlignCenter); self.preview_image.setWordWrap(True); self.preview_image.setFixedSize(200, 220); preview_layout.addWidget(self.preview_image, alignment=Qt.AlignCenter)
         info_row = QHBoxLayout(); info_row.setSpacing(14); info_row.addWidget(info_column, 1); info_row.addWidget(self.preview_card); root.addLayout(info_row)
         task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.select_works = QPushButton("选择作品"); self.select_works.setEnabled(False); self.select_works.setVisible(False); self.select_works.clicked.connect(self._choose_works); top.addWidget(self.select_works); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
         log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
     def _style(self) -> None:
-        self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:7px 12px;min-height:16px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QLabel#preview_image{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px;color:#8992a3;padding:6px} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
+        self.setStyleSheet("QMainWindow{background:#f5f6f8;color:#1d1d1f} QWidget#central_widget{background:#f5f6f8} QLabel{background:transparent} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton:hover{background:#e2e7ef} QPushButton:pressed{background:#d5dce8} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary{background:#2775e8;color:white} QPushButton#primary:hover{background:#3c86ef;color:white} QPushButton#primary:pressed{background:#1f62c7;color:white} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QPushButton#utility{padding:0;min-width:38px;max-width:38px;min-height:38px;max-height:38px} QPushButton#utility:hover{background:#e1e8f3} QPushButton#utility:pressed{background:#cbd6e7} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:7px 12px;min-height:16px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:pressed{background:#cbd8ee;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:checked:pressed{background:#294eaa;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QLabel#preview_image{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px;color:#8992a3;padding:6px} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
     def _mode_key(self) -> str: return self.current_mode
     def _log(self, text: str) -> None:
         line = f"[{datetime.now():%H:%M:%S}] {text}"; self.mode_logs.append(self._mode_key(), line); self.logs.appendPlainText(line); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
@@ -157,6 +158,11 @@ class MainWindow(QMainWindow):
             else:
                 self._set_preview_message("预览不可用")
         reply.finished.connect(done)
+    def _paste_clipboard(self) -> None:
+        text = QApplication.clipboard().text().strip()
+        self.url.clear()
+        if text:
+            self.url.setText(text)
     def _work_type_text(self, info: VideoInfo) -> str:
         return f"图文 · {len(info.image_urls)} 张" if info.work_type == "image" else "视频"
     def _mode_changed(self, mode: str) -> None:
@@ -168,7 +174,7 @@ class MainWindow(QMainWindow):
         if self.current_mode == "single": self._set_preview_message("暂无预览")
     def _set_busy(self, busy: bool) -> None:
         for button in self.mode_buttons.values(): button.setEnabled(not busy)
-        self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
+        self.url.setEnabled(not busy); self.paste_button.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
     def _recognize(self) -> None:
         if self.thread is not None: return
         if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return

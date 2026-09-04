@@ -39,15 +39,68 @@ def test_single_mode_hides_selection_and_busy_recognize_button_is_disabled(monke
     window.mode_buttons["single"].click()
     assert window.select_works.isHidden()
     assert "QPushButton#primary:disabled" in window.styleSheet()
+    assert "QLabel{background:transparent}" in window.styleSheet()
 
     window.url.setText("https://www.douyin.com/video/123")
     monkeypatch.setattr(window, "_run", lambda _worker: None)
     window._recognize()
 
     assert not window.recognize.isEnabled()
+    assert not window.paste_button.isEnabled()
     assert not window.url.isEnabled()
     assert all(not button.isEnabled() for button in window.mode_buttons.values())
     window.close()
+
+
+def test_clipboard_paste_replaces_input_in_both_modes() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    clipboard = app.clipboard()
+    original = clipboard.text()
+    try:
+        assert not window.paste_button.icon().isNull()
+        clipboard.setText("  abc [https://www.douyin.com/](https://www.douyin.com/) xyz  ")
+        window.url.setText("旧链接")
+        window.paste_button.click()
+        assert window.url.text() == "abc [https://www.douyin.com/](https://www.douyin.com/) xyz"
+
+        window.mode_buttons["batch"].click()
+        clipboard.setText("博主主页内容")
+        window.url.setText("另一个旧链接")
+        window.paste_button.click()
+        assert window.url.text() == "博主主页内容"
+
+        window.mode_buttons["single"].click()
+        clipboard.clear()
+        window.url.setText("待清空")
+        window.paste_button.click()
+        assert window.url.text() == ""
+    finally:
+        clipboard.setText(original)
+        window.close()
+
+
+def test_pasting_new_link_clears_previous_single_result_and_preview() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    clipboard = app.clipboard()
+    original = clipboard.text()
+    try:
+        window._recognized(VideoInfo("测试博主", "旧作品", "正文", "https://www.douyin.com/video/1", "1"))
+        assert window.single is not None
+        assert window.preview_image.text() == "预览不可用"
+
+        clipboard.setText("https://www.douyin.com/video/2")
+        window.paste_button.click()
+
+        assert window.single is None
+        assert window.status.text() == "未识别"
+        assert window.summary.text() == "—"
+        assert window.preview_image.text() == "暂无预览"
+        assert not window.start.isEnabled()
+    finally:
+        clipboard.setText(original)
+        window.close()
 
 
 def test_startup_log_is_empty_and_internal_progress_is_not_logged() -> None:
