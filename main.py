@@ -5,396 +5,143 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import sys
+import time
 
 from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QPlainTextEdit,
-    QPushButton,
-    QProgressBar,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
-from douyin_parser import DouyinParseError, VideoInfo, extract_video
+from douyin_parser import DouyinSession, ProfileInfo, ProfileWork, VideoInfo, extract_profile, extract_video
 from storage import save_video
 
 
 class RecognitionWorker(QObject):
-    progress = Signal(str)
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, url: str) -> None:
-        super().__init__()
-        self.url = url
-
+    progress = Signal(str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
+    def __init__(self, mode: str, url: str) -> None: super().__init__(); self.mode = mode; self.url = url
     @Slot()
     def run(self) -> None:
-        try:
-            info = extract_video(self.url, self.progress.emit)
-            self.succeeded.emit(info)
-        except Exception as exc:
-            self.failed.emit(str(exc) or "识别失败，请稍后重试")
-        finally:
-            self.finished.emit()
+        try: self.succeeded.emit(extract_profile(self.url, self.progress.emit) if self.mode == "batch" else extract_video(self.url, self.progress.emit))
+        except Exception as exc: self.failed.emit(str(exc) or "识别失败，请稍后重试")
+        finally: self.finished.emit()
 
 
 class SaveWorker(QObject):
-    progress = Signal(int, str)
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, info: VideoInfo, output_root: Path) -> None:
-        super().__init__()
-        self.info = info
-        self.output_root = output_root
-
+    progress = Signal(int, str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
+    def __init__(self, info: VideoInfo, output_root: Path) -> None: super().__init__(); self.info = info; self.output_root = output_root
     @Slot()
     def run(self) -> None:
         try:
-            self.progress.emit(35, "准备输出目录")
-            self.progress.emit(65, "写入 TXT 文案")
-            author_dir, txt_path, collected_at = save_video(self.info, self.output_root)
-            self.progress.emit(90, "追加 JSONL 记录")
-            self.succeeded.emit((author_dir, txt_path, collected_at))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "保存失败，请检查输出目录权限")
-        finally:
-            self.finished.emit()
+            self.progress.emit(40, "写入 TXT 文案"); result = save_video(self.info, self.output_root); self.progress.emit(90, "追加 JSONL 记录"); self.succeeded.emit(result)
+        except Exception as exc: self.failed.emit(str(exc) or "保存失败，请检查输出目录权限")
+        finally: self.finished.emit()
+
+
+class BatchWorker(QObject):
+    progress = Signal(int, int, str, str); log = Signal(str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
+    def __init__(self, works: list[ProfileWork], output_root: Path) -> None: super().__init__(); self.works = works; self.output_root = output_root
+    @Slot()
+    def run(self) -> None:
+        success = failed = 0; output_dir = None; started = time.monotonic(); total = len(self.works)
+        try:
+            with DouyinSession() as session:
+                for index, work in enumerate(self.works, 1):
+                    self.progress.emit(index, total, work.title, "打开作品页面")
+                    try:
+                        info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
+                        output_dir, txt_path, _ = save_video(info, self.output_root); success += 1; self.log.emit(f"成功 {index}/{total}：{txt_path.name}")
+                    except Exception as exc:
+                        failed += 1; self.log.emit(f"失败 {index}/{total}：{work.title} — {str(exc) or '未知错误'}")
+            self.succeeded.emit((output_dir, success, failed, time.monotonic() - started))
+        except Exception as exc: self.failed.emit(str(exc) or "批量任务无法启动")
+        finally: self.finished.emit()
+
+
+class WorksSelectionDialog(QDialog):
+    def __init__(self, profile: ProfileInfo, parent=None) -> None:
+        super().__init__(parent); self.profile = profile; self.checks: list[QCheckBox] = []; self.manager = QNetworkAccessManager(self); self.setWindowTitle(f"选择 {profile.author} 的作品"); self.resize(820, 680); self._build()
+    def _build(self) -> None:
+        root = QVBoxLayout(self); root.addWidget(QLabel(f"已识别 {len(self.profile.works)} 个当前可访问的公开作品")); scroll = QScrollArea(); scroll.setWidgetResizable(True); content = QWidget(); grid = QGridLayout(content); grid.setSpacing(12)
+        for i, work in enumerate(self.profile.works):
+            card = QGroupBox(); layout = QVBoxLayout(card); image = QLabel("封面加载中"); image.setAlignment(Qt.AlignCenter); image.setFixedSize(170, 150); image.setStyleSheet("background:#eef1f5;border-radius:8px;color:#858995;"); layout.addWidget(image, alignment=Qt.AlignCenter)
+            title = QLabel(_short(work.title, 42)); title.setWordWrap(True); title.setFixedHeight(42); layout.addWidget(title); check = QCheckBox("选择"); check.stateChanged.connect(self._update_count); layout.addWidget(check); self.checks.append(check)
+            if work.cover_url: self._load_cover(work.cover_url, image)
+            grid.addWidget(card, i // 4, i % 4)
+        scroll.setWidget(content); root.addWidget(scroll, 1); bottom = QHBoxLayout(); self.count = QLabel(); all_button = QPushButton("全选"); none_button = QPushButton("取消全选"); all_button.clicked.connect(lambda: self._set_all(True)); none_button.clicked.connect(lambda: self._set_all(False)); bottom.addWidget(self.count); bottom.addStretch(); bottom.addWidget(all_button); bottom.addWidget(none_button)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok); self.buttons.button(QDialogButtonBox.Ok).setText("确认选择"); self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); bottom.addWidget(self.buttons); root.addLayout(bottom); self._update_count()
+    def _load_cover(self, url: str, label: QLabel) -> None:
+        reply = self.manager.get(QNetworkRequest(QUrl(url)))
+        def done() -> None:
+            data = reply.readAll(); pixmap = QPixmap(); reply.deleteLater()
+            if pixmap.loadFromData(data): label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else: label.setText("封面不可用")
+        reply.finished.connect(done)
+    def _set_all(self, checked: bool) -> None:
+        for check in self.checks: check.setChecked(checked)
+    def _update_count(self) -> None:
+        count = sum(check.isChecked() for check in self.checks); self.count.setText(f"已选 {count} 项"); self.buttons.button(QDialogButtonBox.Ok).setEnabled(count > 0)
+    def selected(self) -> list[ProfileWork]: return [work for work, check in zip(self.profile.works, self.checks) if check.isChecked()]
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
-        super().__init__()
-        self._recognized: VideoInfo | None = None
-        self._last_output_dir: Path | None = None
-        self._thread: QThread | None = None
-        self._worker: QObject | None = None
-        self._build_ui()
-        self._apply_style()
-        self._append_log("应用已启动，等待输入抖音链接")
-
-    def _build_ui(self) -> None:
-        self.setWindowTitle("Vidpick")
-        self.setMinimumSize(760, 680)
-        self.resize(900, 760)
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(32, 28, 32, 28)
-        root.setSpacing(18)
-
-        title_row = QHBoxLayout()
-        title_block = QVBoxLayout()
-        title = QLabel("Vidpick")
-        title.setObjectName("appTitle")
-        subtitle = QLabel("本地抖音文案采集")
-        subtitle.setObjectName("subTitle")
-        title_block.addWidget(title)
-        title_block.addWidget(subtitle)
-        title_row.addLayout(title_block)
-        title_row.addStretch()
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["单个链接", "批量链接（暂未启用）"])
-        self.mode_combo.setToolTip("当前仅支持单个链接采集")
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
-        title_row.addWidget(self.mode_combo)
-        root.addLayout(title_row)
-
-        input_group = QGroupBox("链接")
-        input_layout = QGridLayout(input_group)
-        input_layout.setContentsMargins(18, 18, 18, 18)
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("粘贴 douyin.com 分享链接或短链接")
-        self.url_input.textChanged.connect(self._input_changed)
-        self.recognize_button = QPushButton("识别")
-        self.recognize_button.setObjectName("primaryButton")
-        self.recognize_button.clicked.connect(self._recognize)
-        input_layout.addWidget(self.url_input, 0, 0)
-        input_layout.addWidget(self.recognize_button, 0, 1)
-        root.addWidget(input_group)
-
-        result_group = QGroupBox("识别结果")
-        result_layout = QFormLayout(result_group)
-        result_layout.setContentsMargins(18, 18, 18, 18)
-        result_layout.setHorizontalSpacing(20)
-        self.result_status = QLabel("未识别")
-        self.result_status.setObjectName("statusNeutral")
-        self.author_value = QLabel("—")
-        self.author_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.title_value = QLabel("—")
-        self.title_value.setWordWrap(True)
-        self.title_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.final_url_value = QLabel("—")
-        self.final_url_value.setWordWrap(True)
-        self.final_url_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.content_preview = QLabel("识别成功后显示正文摘要")
-        self.content_preview.setObjectName("mutedText")
-        self.content_preview.setWordWrap(True)
-        self.content_preview.setMaximumHeight(72)
-        result_layout.addRow("状态", self.result_status)
-        result_layout.addRow("博主", self.author_value)
-        result_layout.addRow("标题 / 摘要", self.title_value)
-        result_layout.addRow("最终链接", self.final_url_value)
-        result_layout.addRow("正文", self.content_preview)
-        root.addWidget(result_group)
-
-        task_group = QGroupBox("任务")
-        task_layout = QVBoxLayout(task_group)
-        task_layout.setContentsMargins(18, 18, 18, 18)
-        task_top = QHBoxLayout()
-        self.step_label = QLabel("等待识别")
-        self.step_label.setObjectName("stepLabel")
-        task_top.addWidget(self.step_label)
-        task_top.addStretch()
-        self.start_button = QPushButton("开始任务")
-        self.start_button.setEnabled(False)
-        self.start_button.clicked.connect(self._start_task)
-        task_top.addWidget(self.start_button)
-        task_layout.addLayout(task_top)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        task_layout.addWidget(self.progress_bar)
-        root.addWidget(task_group)
-
-        log_group = QGroupBox("状态 / 日志")
-        log_layout = QVBoxLayout(log_group)
-        log_layout.setContentsMargins(18, 18, 18, 18)
-        self.log_area = QPlainTextEdit()
-        self.log_area.setReadOnly(True)
-        self.log_area.setMinimumHeight(130)
-        self.log_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        log_layout.addWidget(self.log_area)
-        root.addWidget(log_group, 1)
-
-        bottom_row = QHBoxLayout()
-        bottom_row.addStretch()
-        self.open_folder_button = QPushButton("打开保存文件夹")
-        self.open_folder_button.setEnabled(False)
-        self.open_folder_button.clicked.connect(self._open_folder)
-        bottom_row.addWidget(self.open_folder_button)
-        root.addLayout(bottom_row)
-
-    def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget { background: #f5f6f8; color: #1d1d1f; }
-            QGroupBox { background: white; border: 1px solid #e4e6eb; border-radius: 14px; margin-top: 10px; padding-top: 12px; font-weight: 600; }
-            QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 5px; color: #63666f; }
-            QLabel#appTitle { font-size: 28px; font-weight: 700; color: #111216; }
-            QLabel#subTitle, QLabel#mutedText { color: #777b85; }
-            QLabel#stepLabel { color: #535762; font-weight: 600; }
-            QLabel#statusNeutral { color: #777b85; }
-            QLineEdit, QPlainTextEdit, QComboBox { background: #fbfbfc; border: 1px solid #dfe2e8; border-radius: 10px; padding: 9px 11px; }
-            QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus { border: 1px solid #7d9df2; }
-            QPushButton { background: #eef1f7; border: none; border-radius: 10px; padding: 10px 18px; font-weight: 600; }
-            QPushButton:hover { background: #e0e6f5; }
-            QPushButton:disabled { color: #a8abb2; background: #eceef2; }
-            QPushButton#primaryButton, QPushButton:default { background: #2775e8; color: white; }
-            QPushButton#primaryButton:hover { background: #1f63c8; }
-            QProgressBar { background: #e8ebf1; border: none; border-radius: 6px; height: 12px; text-align: center; color: #525761; }
-            QProgressBar::chunk { background: #2775e8; border-radius: 6px; }
-            """
-        )
-
-    def _append_log(self, message: str) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        self.log_area.appendPlainText(f"[{stamp}] {message}")
-        scrollbar = self.log_area.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    @Slot(str)
-    def _worker_progress(self, message: str) -> None:
-        self.step_label.setText(message)
-        self._append_log(message)
-
-    @Slot(int, str)
-    def _save_progress(self, percent: int, message: str) -> None:
-        self.progress_bar.setValue(percent)
-        self.step_label.setText(message)
-        self._append_log(message)
-
-    def _set_busy(self, busy: bool) -> None:
-        self.mode_combo.setEnabled(not busy)
-        self.url_input.setEnabled(not busy and self.mode_combo.currentIndex() == 0)
-        self.recognize_button.setEnabled(not busy and self.mode_combo.currentIndex() == 0)
-        self.start_button.setEnabled(not busy and self._recognized is not None and self.mode_combo.currentIndex() == 0)
-
-    def _input_changed(self, _value: str) -> None:
-        if self._thread is not None:
-            return
-        self._recognized = None
-        self.start_button.setEnabled(False)
-        self.open_folder_button.setEnabled(False)
-        self.result_status.setText("未识别")
-        self.result_status.setObjectName("statusNeutral")
-        self.result_status.style().unpolish(self.result_status)
-        self.result_status.style().polish(self.result_status)
-        self.author_value.setText("—")
-        self.title_value.setText("—")
-        self.final_url_value.setText("—")
-        self.content_preview.setText("识别成功后显示正文摘要")
-        self.step_label.setText("等待识别")
-        self.progress_bar.setValue(0)
-
-    def _mode_changed(self, index: int) -> None:
-        if index == 1:
-            self._recognized = None
-            self.start_button.setEnabled(False)
-            self.recognize_button.setEnabled(False)
-            self.url_input.setEnabled(False)
-            self.result_status.setText("暂未启用")
-            self.step_label.setText("批量模式暂未启用")
-            self._append_log("批量模式暂未启用，本次仅支持单个链接")
-        else:
-            self.url_input.setEnabled(True)
-            self.recognize_button.setEnabled(True)
-            self._input_changed(self.url_input.text())
-
+        super().__init__(); self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self._build(); self._style(); self._log("应用已启动")
+    def _build(self) -> None:
+        self.setWindowTitle("Vidpick"); self.resize(900, 760); self.setMinimumSize(760, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
+        header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch(); self.mode = QComboBox(); self.mode.addItems(["单个链接", "博主主页批量"]); self.mode.currentIndexChanged.connect(self._mode_changed); header.addWidget(self.mode); root.addLayout(header)
+        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴 douyin.com 作品分享链接"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); root.addWidget(link_group)
+        result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("详情", self.detail); root.addWidget(result)
+        task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
+        log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
+    def _style(self) -> None:
+        self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit,QComboBox{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
+    def _log(self, text: str) -> None: self.logs.appendPlainText(f"[{datetime.now():%H:%M:%S}] {text}")
+    def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴 douyin.com 作品分享链接"); self._reset()
+    def _reset(self, *_args) -> None:
+        if self.thread: return
+        self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
+    def _set_busy(self, busy: bool) -> None: self.mode.setEnabled(not busy); self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.start.setEnabled(not busy and bool(self.single or self.selected))
     def _recognize(self) -> None:
-        if not self.url_input.text().strip():
-            self.result_status.setText("失败：请输入链接")
-            self._append_log("错误：请输入抖音作品链接")
-            return
-        self._recognized = None
-        self._last_output_dir = None
-        self.start_button.setEnabled(False)
-        self.open_folder_button.setEnabled(False)
-        self.result_status.setText("识别中…")
-        self.author_value.setText("—")
-        self.title_value.setText("—")
-        self.final_url_value.setText("—")
-        self.content_preview.setText("正在读取页面…")
-        self.progress_bar.setValue(5)
-        self.step_label.setText("准备识别")
-        self._append_log("开始识别链接")
-        worker = RecognitionWorker(self.url_input.text())
-        self._run_worker(worker, worker.succeeded, worker.failed, worker.progress)
-
-    @Slot(object)
-    def _recognition_succeeded(self, info: VideoInfo) -> None:
-        self._recognized = info
-        self.progress_bar.setValue(100)
-        self.step_label.setText("识别完成，可以开始任务")
-        self.result_status.setText("成功")
-        self.result_status.setObjectName("statusSuccess")
-        self.result_status.style().unpolish(self.result_status)
-        self.result_status.style().polish(self.result_status)
-        self.author_value.setText(info.author)
-        self.title_value.setText(info.title)
-        self.final_url_value.setText(info.url)
-        summary = info.content.replace("\n", " ")
-        self.content_preview.setText(summary[:240] + ("…" if len(summary) > 240 else ""))
-        self._append_log(f"识别成功：{info.author} / {info.title}")
-
-    @Slot(str)
-    def _recognition_failed(self, message: str) -> None:
-        self._recognized = None
-        self.progress_bar.setValue(0)
-        self.step_label.setText("识别失败，请修正后重试")
-        self.result_status.setText("失败")
-        self.result_status.setObjectName("statusError")
-        self.result_status.style().unpolish(self.result_status)
-        self.result_status.style().polish(self.result_status)
-        self.content_preview.setText(message)
-        self._append_log(f"错误：{message}")
-
-    def _start_task(self) -> None:
-        if self._recognized is None:
-            return
-        self.progress_bar.setValue(10)
-        self.step_label.setText("开始保存任务")
-        self.result_status.setText("执行中…")
-        self._append_log("识别结果有效，开始保存任务")
-        output_root = Path(__file__).resolve().parent / "output"
-        worker = SaveWorker(self._recognized, output_root)
-        self._run_worker(worker, worker.succeeded, worker.failed, worker.progress)
-
-    @Slot(object)
-    def _save_succeeded(self, result: tuple[Path, Path, str]) -> None:
-        author_dir, txt_path, collected_at = result
-        self._last_output_dir = author_dir
-        self.progress_bar.setValue(100)
-        self.step_label.setText("任务完成")
-        self.result_status.setText("成功")
-        self.result_status.setObjectName("statusSuccess")
-        self.result_status.style().unpolish(self.result_status)
-        self.result_status.style().polish(self.result_status)
-        self.open_folder_button.setEnabled(True)
-        self._append_log(f"已保存：{txt_path.name}")
-        self._append_log(f"任务完成：{author_dir}（{collected_at}）")
-
-    @Slot(str)
-    def _save_failed(self, message: str) -> None:
-        self.progress_bar.setValue(0)
-        self.step_label.setText("保存失败，请重试")
-        self.result_status.setText("失败")
-        self.result_status.setObjectName("statusError")
-        self.result_status.style().unpolish(self.result_status)
-        self.result_status.style().polish(self.result_status)
-        self._append_log(f"错误：{message}")
-
-    def _run_worker(self, worker: QObject, success_signal, failed_signal, progress_signal) -> None:
-        if self._thread is not None:
-            return
-        self._set_busy(True)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        self._thread = thread
-        self._worker = worker
-        if isinstance(worker, RecognitionWorker):
-            success_signal.connect(self._recognition_succeeded)
-            failed_signal.connect(self._recognition_failed)
-            progress_signal.connect(self._worker_progress)
-        else:
-            success_signal.connect(self._save_succeeded)
-            failed_signal.connect(self._save_failed)
-            progress_signal.connect(self._save_progress)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._worker_finished)
+        if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return
+        self._reset(); self.status.setText("识别中…"); self.step.setText("准备识别"); self.progress.setValue(5); self._log("开始识别链接"); self._run(RecognitionWorker("batch" if self.mode.currentIndex() else "single", self.url.text()))
+    def _start(self) -> None:
+        root = Path(__file__).resolve().parent / "output"; self.open_folder.setEnabled(False)
+        if self.single: self._log("开始保存单条作品"); self._run(SaveWorker(self.single, root))
+        else: self._log(f"开始批量任务：{len(self.selected)} 项"); self._run(BatchWorker(self.selected, root))
+    def _run(self, worker: QObject) -> None:
+        self._set_busy(True); thread = QThread(self); worker.moveToThread(thread); self.thread = thread; self.worker = worker; thread.started.connect(worker.run); worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater); thread.finished.connect(self._finished)
+        if isinstance(worker, RecognitionWorker): worker.progress.connect(self._progress_text); worker.succeeded.connect(self._recognized); worker.failed.connect(self._failed)
+        elif isinstance(worker, SaveWorker): worker.progress.connect(self._save_progress); worker.succeeded.connect(self._saved); worker.failed.connect(self._failed)
+        else: worker.progress.connect(self._batch_progress); worker.log.connect(self._log); worker.succeeded.connect(self._batch_done); worker.failed.connect(self._failed)
         thread.start()
-
-    @Slot()
-    def _worker_finished(self) -> None:
-        self._thread = None
-        self._worker = None
-        self._set_busy(False)
-
-    def _open_folder(self) -> None:
-        if self._last_output_dir and self._last_output_dir.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._last_output_dir)))
-            self._append_log("已打开本次保存文件夹")
+    @Slot(str)
+    def _progress_text(self, text: str) -> None: self.step.setText(text); self._log(text)
+    @Slot(int, str)
+    def _save_progress(self, value: int, text: str) -> None: self.progress.setValue(value); self.step.setText(text); self._log(text)
+    @Slot(object)
+    def _recognized(self, result: object) -> None:
+        self.progress.setValue(100)
+        if isinstance(result, VideoInfo): self.single = result; self.author.setText(result.author); self.summary.setText(result.title); self.detail.setText(result.content[:240] + ("…" if len(result.content) > 240 else "")); self.status.setText("成功"); self.step.setText("识别完成，可以开始任务"); self._log(f"识别成功：{result.author} / {result.title}")
         else:
-            self._append_log("保存文件夹不存在，请先完成一次任务")
+            self.profile = result; self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.detail.setText("正在选择要采集的作品"); self.status.setText("成功"); self._log(f"主页识别成功：{result.author}，{len(result.works)} 项"); dialog = WorksSelectionDialog(result, self)
+            if dialog.exec() == QDialog.Accepted: self.selected = dialog.selected(); self.summary.setText(f"识别到 {len(result.works)} 个公开作品，已选择 {len(self.selected)} 项"); self.detail.setText("已选择作品，点击“开始任务”后顺序采集"); self.step.setText("选择完成，可以开始任务"); self.start.setEnabled(True)
+            else: self.step.setText("未选择作品，可重新识别")
+    @Slot(int, int, str, str)
+    def _batch_progress(self, index: int, total: int, title: str, step: str) -> None: self.progress.setValue(int((index - 1) * 100 / total)); self.step.setText(f"当前 {index}/{total}：{_short(title, 36)} — {step}"); self._log(self.step.text())
+    @Slot(object)
+    def _saved(self, result: object) -> None: self.output_dir, txt, when = result; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True); self._log(f"已保存：{txt.name}（{when}）")
+    @Slot(object)
+    def _batch_done(self, result: object) -> None:
+        folder, success, failed, elapsed = result; self.output_dir = folder; self.progress.setValue(100); self.status.setText("完成" if not failed else "完成（含失败项）"); self.step.setText(f"批量完成：成功 {success}，失败 {failed}"); self.open_folder.setEnabled(folder is not None); self._log(f"批量结束：成功 {success}，失败 {failed}，耗时 {elapsed:.1f} 秒")
+    @Slot(str)
+    def _failed(self, message: str) -> None: self.status.setText("失败"); self.step.setText("任务失败，可修正后重试"); self.progress.setValue(0); self._log(f"错误：{message}")
+    @Slot()
+    def _finished(self) -> None: self.thread = None; self.worker = None; self._set_busy(False)
+    def _open_folder(self) -> None:
+        if self.output_dir and self.output_dir.exists(): QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir))); self._log("已打开保存文件夹")
 
 
+def _short(value: str, size: int) -> str: return value[:size] + ("…" if len(value) > size else "")
 def run() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName("Vidpick")
-    window = MainWindow()
-    window.show()
-    return app.exec()
-
-
-if __name__ == "__main__":
-    raise SystemExit(run())
+    app = QApplication(sys.argv); app.setApplicationName("Vidpick"); window = MainWindow(); window.show(); return app.exec()
+if __name__ == "__main__": raise SystemExit(run())

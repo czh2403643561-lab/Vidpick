@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import html as html_lib
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -23,6 +23,20 @@ class VideoInfo:
     title: str
     content: str
     url: str
+
+
+@dataclass(frozen=True)
+class ProfileWork:
+    url: str
+    cover_url: str
+    title: str
+
+
+@dataclass(frozen=True)
+class ProfileInfo:
+    author: str
+    url: str
+    works: tuple[ProfileWork, ...]
 
 
 ProgressCallback = Callable[[str], None]
@@ -50,50 +64,185 @@ def normalize_douyin_url(value: str) -> str:
 def extract_video(url: str, progress: ProgressCallback | None = None) -> VideoInfo:
     """Open a Douyin URL in Chromium and extract the first complete usable record."""
 
-    normalized_url = normalize_douyin_url(url)
-    report = progress or (lambda _message: None)
+    with DouyinSession(progress) as session:
+        return session.extract_video(url)
 
+
+def extract_profile(url: str, progress: ProgressCallback | None = None) -> ProfileInfo:
+    """Open a Douyin profile and return every public work visible to this environment."""
+
+    with DouyinSession(progress) as session:
+        return session.extract_profile(url)
+
+
+class DouyinSession:
+    """One Playwright browser/context, reusable for profile and sequential video work."""
+
+    def __init__(self, progress: ProgressCallback | None = None) -> None:
+        self._report = progress or (lambda _message: None)
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    def __enter__(self) -> "DouyinSession":
+        try:
+            self._report("启动 Chromium")
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(headless=True)
+            self._context = self._browser.new_context(
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 1000},
+            )
+            self._page = self._context.new_page()
+            return self
+        except Exception as exc:
+            self.__exit__(None, None, None)
+            raise _as_parse_error(exc, "启动 Chromium 失败") from exc
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        if self._context is not None:
+            self._context.close()
+        if self._browser is not None:
+            self._browser.close()
+        if self._playwright is not None:
+            self._playwright.stop()
+        self._page = self._context = self._browser = self._playwright = None
+
+    def extract_video(self, url: str) -> VideoInfo:
+        normalized_url = normalize_douyin_url(url)
+        page = self._require_page()
+        try:
+            self._report("打开作品链接并等待跳转")
+            page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
+            self._wait_for_page(page)
+            self._report("读取页面数据")
+            page_html = page.content()
+            body_text = _body_text(page)
+            self._report("解析作者和作品正文")
+            return parse_html(page_html, page.url or normalized_url, body_text)
+        except DouyinParseError:
+            raise
+        except Exception as exc:
+            raise _as_parse_error(exc, "访问或解析作品页面失败") from exc
+
+    def extract_profile(self, url: str) -> ProfileInfo:
+        normalized_url = normalize_douyin_url(url)
+        page = self._require_page()
+        try:
+            self._report("打开博主主页并等待跳转")
+            page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
+            self._wait_for_page(page)
+            self._report("读取公开作品列表")
+            works = self._scroll_profile_works(page)
+            return parse_profile_page(page.url or normalized_url, page.title(), _body_text(page), works)
+        except DouyinParseError:
+            raise
+        except Exception as exc:
+            raise _as_parse_error(exc, "访问或解析博主主页失败") from exc
+
+    def _wait_for_page(self, page) -> None:
+        try:
+            page.wait_for_load_state("networkidle", timeout=12_000)
+        except PlaywrightTimeoutError:
+            self._report("页面仍在加载，继续读取当前内容")
+        page.wait_for_timeout(1_500)
+
+    def _scroll_profile_works(self, page) -> list[dict[str, str]]:
+        cards: list[dict[str, str]] = []
+        known_urls: set[str] = set()
+        idle_rounds = 0
+        for _ in range(40):
+            current_cards = _read_profile_cards(page)
+            new_cards = [item for item in current_cards if item.get("url") not in known_urls]
+            if new_cards:
+                cards.extend(new_cards)
+                known_urls.update(item["url"] for item in new_cards)
+                idle_rounds = 0
+                self._report(f"已识别 {len(cards)} 个公开作品")
+            else:
+                idle_rounds += 1
+            if idle_rounds >= 3:
+                break
+            page.mouse.wheel(0, 1_600)
+            page.wait_for_timeout(1_200)
+        return cards
+
+    def _require_page(self):
+        if self._page is None:
+            raise DouyinParseError("浏览器会话尚未启动")
+        return self._page
+
+
+def parse_profile_page(
+    final_url: str,
+    document_title: str,
+    body_text: str,
+    cards: Iterable[dict[str, str]],
+) -> ProfileInfo:
+    """Pure profile parsing: suitable for unit tests and independent of page selectors."""
+
+    author = _profile_author(document_title, body_text)
+    works = tuple(normalize_profile_cards(cards))
+    if not author:
+        raise DouyinParseError("未能识别博主名称，页面可能需要登录或结构发生变化")
+    if not works:
+        raise DouyinParseError("未识别到可访问的公开作品，可能需要登录或页面受限")
+    return ProfileInfo(author=author, url=final_url, works=works)
+
+
+def normalize_profile_cards(cards: Iterable[dict[str, str]]) -> list[ProfileWork]:
+    """Clean/dedupe browser card data while keeping only real video or note links."""
+
+    works: list[ProfileWork] = []
+    seen_urls: set[str] = set()
+    for card in cards:
+        url = _canonical_work_url(str(card.get("url", "")))
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = _profile_card_title(str(card.get("title", "")))
+        cover_url = str(card.get("cover_url", "")).strip()
+        if not re.match(r"^https?://", cover_url, re.IGNORECASE):
+            cover_url = ""
+        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品"))
+    return works
+
+
+def _read_profile_cards(page) -> list[dict[str, str]]:
+    primary = page.locator("[data-e2e='user-post-list'] a[href*='/video/'], [data-e2e='user-post-list'] a[href*='/note/']")
+    locator = primary if primary.count() else page.locator("a[href*='/video/'], a[href*='/note/']")
+    return locator.evaluate_all(
+        """els => els.filter(a => !a.closest('footer')).map(a => {
+            const image = a.querySelector('img');
+            const paragraph = a.querySelector('p');
+            return {
+                url: a.href,
+                cover_url: image ? (image.currentSrc || image.src || '') : '',
+                title: (paragraph ? paragraph.innerText : '') || a.innerText || (image ? image.alt : '') || ''
+            };
+        })"""
+    )
+
+
+def _body_text(page) -> str:
     try:
-        with sync_playwright() as playwright:
-            report("启动 Chromium")
-            browser = playwright.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(
-                    locale="zh-CN",
-                    timezone_id="Asia/Shanghai",
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1440, "height": 1000},
-                )
-                page = context.new_page()
-                report("打开链接并等待跳转")
-                page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=12_000)
-                except PlaywrightTimeoutError:
-                    report("页面仍在加载，继续读取当前内容")
-                page.wait_for_timeout(1_500)
-                report("读取页面数据")
-                page_html = page.content()
-                try:
-                    body_text = page.locator("body").inner_text(timeout=5_000)
-                except Exception:
-                    body_text = ""
-                final_url = page.url or normalized_url
-                report("解析作者和作品正文")
-                return parse_html(page_html, final_url, body_text)
-            finally:
-                browser.close()
-    except DouyinParseError:
-        raise
-    except PlaywrightTimeoutError as exc:
-        raise DouyinParseError("网络访问超时，请检查链接或网络后重试") from exc
-    except Exception as exc:
-        message = str(exc).strip().splitlines()[0] if str(exc).strip() else "未知错误"
-        raise DouyinParseError(f"访问或解析页面失败：{message}") from exc
+        return page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        return ""
+
+
+def _as_parse_error(exc: Exception, prefix: str) -> DouyinParseError:
+    if isinstance(exc, PlaywrightTimeoutError):
+        return DouyinParseError("网络访问超时，请检查链接或网络后重试")
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else "未知错误"
+    return DouyinParseError(f"{prefix}：{message}")
 
 
 def parse_html(page_html: str, final_url: str, body_text: str = "") -> VideoInfo:
@@ -135,11 +284,15 @@ def parse_html(page_html: str, final_url: str, body_text: str = "") -> VideoInfo
     author = _pick_candidate(author_candidates, max_length=120)
     title = _pick_title(title_candidates)
     content = _pick_content(content_candidates)
+    rendered_content = _content_from_visible_text(visible_text, headings, content)
 
     if not author:
-        author = _author_from_text(document_title or meta_title or visible_text)
-    if not content:
-        content = _content_from_visible_text(visible_text, headings)
+        for source in (document_title, meta_title, visible_text):
+            author = _author_from_text(source)
+            if author:
+                break
+    if rendered_content and (not content or len(rendered_content) > len(content)):
+        content = rendered_content
     if not title and content:
         title = _first_line(content, 80)
     if not author:
@@ -312,6 +465,8 @@ def _pick_content(candidates: list[tuple[int, str]]) -> str:
 def _author_from_text(value: str) -> str:
     value = _clean_text(value)
     patterns = (
+        r"[-—]\s*([^\n]{1,80}?)于\d{4,}发布",
+        r"(?:^|\n)([^\n]{1,80})\s*\n+\s*(?:粉丝|获赞)",
         r"(?:作者|博主|用户)\s*[:：]\s*([^|｜\n]{1,80})",
         r"^([^|｜\n]{1,80})的抖音",
     )
@@ -322,7 +477,43 @@ def _author_from_text(value: str) -> str:
     return ""
 
 
-def _content_from_visible_text(visible_text: str, headings: list[str]) -> str:
+def _profile_author(document_title: str, body_text: str) -> str:
+    for source in (document_title, body_text):
+        match = re.search(r"^(.+?)的抖音(?:\s*[-_|｜].*)?$", _clean_text(source), re.IGNORECASE)
+        if match:
+            return _clean_text(match.group(1))
+    body_match = re.search(r"(?:^|\n)([^\n]{1,80})\s*\n+\s*(?:关注|粉丝|获赞)", body_text)
+    return _clean_text(body_match.group(1)) if body_match else ""
+
+
+def _canonical_work_url(value: str) -> str:
+    value = value.strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if not host.endswith("douyin.com") or not re.search(r"/(?:video|note)/\d+", parsed.path):
+        return ""
+    match = re.search(r"/(?:video|note)/\d+", parsed.path)
+    return f"https://www.douyin.com{match.group(0)}" if match else ""
+
+
+def _profile_card_title(value: str) -> str:
+    lines = [_clean_text(line) for line in value.splitlines()]
+    useful = [
+        line
+        for line in lines
+        if line
+        and line != "置顶"
+        and not re.fullmatch(r"[\d.]+(?:万)?", line)
+    ]
+    title = " ".join(useful)
+    if "：" in title and len(title.split("：", 1)[0]) <= 40:
+        title = title.split("：", 1)[1]
+    return _clean_text(title)[:240]
+
+
+def _content_from_visible_text(visible_text: str, headings: list[str], seed: str = "") -> str:
     if not visible_text:
         return ""
     heading_set = {_clean_text(item) for item in headings}
@@ -330,6 +521,11 @@ def _content_from_visible_text(visible_text: str, headings: list[str]) -> str:
     lines = [line for line in lines if len(line) >= 4 and line not in heading_set]
     if not lines:
         return ""
+    seed = _clean_text(seed).replace("\n", " ")[:32]
+    if seed:
+        matching_lines = [line for line in lines if seed in line]
+        if matching_lines:
+            return max(matching_lines, key=len)[:5_000]
     return max(lines, key=len)[:5_000]
 
 

@@ -1,4 +1,4 @@
-from douyin_parser import parse_html
+from douyin_parser import normalize_profile_cards, parse_html, parse_profile_page
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -30,3 +30,28 @@ def test_parse_html_falls_back_to_rendered_text() -> None:
     assert info.author == "小红"
     assert info.title == "旅行日记"
     assert "渲染后的完整正文" in info.content
+
+
+def test_profile_parser_dedupes_cards_and_uses_profile_title() -> None:
+    profile = parse_profile_page(
+        "https://www.douyin.com/user/example",
+        "LightNING的抖音 - 抖音",
+        "LightNING\n关注",
+        [
+            {"url": "https://www.douyin.com/note/123", "cover_url": "https://cover/1.jpg", "title": "置顶\n5.2万\n第一篇作品"},
+            {"url": "https://www.douyin.com/note/123?share=1", "cover_url": "", "title": "重复"},
+            {"url": "https://www.douyin.com/video/456", "cover_url": "", "title": "第二篇作品"},
+        ],
+    )
+
+    assert profile.author == "LightNING"
+    assert len(profile.works) == 2
+    assert profile.works[0].title == "第一篇作品"
+
+
+def test_normalize_profile_cards_ignores_non_work_links() -> None:
+    works = normalize_profile_cards([
+        {"url": "https://www.douyin.com/user/a", "title": "主页"},
+        {"url": "//www.douyin.com/video/999", "title": "作品"},
+    ])
+    assert [work.url for work in works] == ["https://www.douyin.com/video/999"]
