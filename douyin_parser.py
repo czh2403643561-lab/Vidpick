@@ -24,6 +24,7 @@ class VideoInfo:
     title: str
     content: str
     url: str
+    aweme_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,35 @@ def extract_target_aweme_id(value: str) -> str | None:
     return None
 
 
+def canonical_work_url(value: str, target_aweme_id: str) -> str:
+    """Return the direct work page for a known target ID.
+
+    A direct video/note URL is already the best address.  Web profile URLs
+    carrying ``vid``/``modal_id`` instead start from the video detail route.
+    """
+
+    normalized = normalize_douyin_url(value)
+    direct = re.search(r"/(?:video|note)/(\d+)", urlparse(normalized).path)
+    if direct and direct.group(1) == target_aweme_id:
+        return normalized
+    return f"https://www.douyin.com/video/{target_aweme_id}"
+
+
+def _target_navigation_urls(normalized_url: str, target_aweme_id: str) -> tuple[str, ...]:
+    """Try a direct work page first; only then use narrow fallbacks."""
+
+    primary = canonical_work_url(normalized_url, target_aweme_id)
+    direct = re.search(r"/(?:video|note)/(\d+)", urlparse(normalized_url).path)
+    if direct and direct.group(1) == target_aweme_id:
+        return (primary,)
+    candidates = (
+        primary,
+        f"https://www.douyin.com/note/{target_aweme_id}",
+        normalized_url,
+    )
+    return tuple(dict.fromkeys(candidates))
+
+
 def extract_video(url: str, progress: ProgressCallback | None = None) -> VideoInfo:
     """Open a Douyin URL in Chromium and extract the first complete usable record."""
 
@@ -110,6 +140,8 @@ class DouyinSession:
         self._context = None
         self._page = None
         self._awemes: list[dict[str, Any]] = []
+        self._target_aweme_id: str | None = None
+        self._target_aweme: dict[str, Any] | None = None
 
     def __enter__(self) -> "DouyinSession":
         try:
@@ -151,21 +183,28 @@ class DouyinSession:
         page = self._require_page()
         report = progress or self._report
         try:
-            self._awemes.clear()
-            report("打开作品链接并等待跳转")
-            page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
-            target = extract_target_aweme_id(page.url) or requested_target
-            if not target:
-                raise DouyinParseError("未能确认目标作品 ID，请重试")
-            report("等待目标作品数据")
-            matched = self._wait_for_target_aweme(target)
-            report("读取页面数据")
-            report("解析作者和作品正文")
-            if matched:
-                structured = _video_from_aweme(matched, page.url or normalized_url)
-                if structured.content:
-                    return structured
-            return parse_target_html(page.content(), page.url or normalized_url, target)
+            targets = _target_navigation_urls(normalized_url, requested_target) if requested_target else (normalized_url,)
+            last_error: DouyinParseError | None = None
+            for index, navigation_url in enumerate(targets):
+                self._reset_aweme_capture(requested_target)
+                report("打开目标作品页" if index == 0 else "尝试备用作品地址")
+                page.goto(navigation_url, wait_until="domcontentloaded", timeout=35_000)
+                target = requested_target or extract_target_aweme_id(page.url)
+                if not target:
+                    raise DouyinParseError("未能确认目标作品 ID，请重试")
+                self._target_aweme_id = target
+                report("等待目标作品数据")
+                matched = self._wait_for_target_aweme(target)
+                report("解析作者和作品正文")
+                if matched:
+                    structured = _video_from_aweme(matched, page.url or navigation_url)
+                    if structured.content and structured.aweme_id == target:
+                        return structured
+                try:
+                    return parse_target_html(page.content(), page.url or navigation_url, target)
+                except DouyinParseError as exc:
+                    last_error = exc
+            raise last_error or DouyinParseError("未能确认目标作品数据，请重试")
         except DouyinParseError:
             raise
         except Exception as exc:
@@ -175,7 +214,7 @@ class DouyinSession:
         normalized_url = normalize_douyin_url(url)
         page = self._require_page()
         try:
-            self._awemes.clear()
+            self._reset_aweme_capture()
             self._report("打开博主主页并等待跳转")
             page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
             self._wait_for_page(page)
@@ -185,7 +224,7 @@ class DouyinSession:
                 works = self._scroll_profile_works(page)
             if not works:
                 self._report("未读取到作品，正在重新加载一次")
-                self._awemes.clear(); page.reload(wait_until="domcontentloaded", timeout=35_000); self._wait_for_page(page)
+                self._reset_aweme_capture(); page.reload(wait_until="domcontentloaded", timeout=35_000); self._wait_for_page(page)
                 works = _works_from_awemes(self._awemes) or self._scroll_profile_works(page)
             return parse_profile_page(page.url or normalized_url, page.title(), _body_text(page), works)
         except DouyinParseError:
@@ -226,12 +265,19 @@ class DouyinSession:
         return self._page
 
     def _wait_for_target_aweme(self, target: str) -> dict[str, Any] | None:
-        for _ in range(25):
+        for _ in range(40):
+            if self._target_aweme and str(self._target_aweme.get("aweme_id", "")) == target:
+                return self._target_aweme
             for item in self._awemes:
                 if str(item.get("aweme_id", "")) == target:
                     return item
-            self._page.wait_for_timeout(200)
+            self._page.wait_for_timeout(100)
         return None
+
+    def _reset_aweme_capture(self, target: str | None = None) -> None:
+        self._awemes.clear()
+        self._target_aweme_id = target
+        self._target_aweme = None
 
     def _capture_response(self, response) -> None:
         if "/aweme/" not in response.url or "json" not in response.headers.get("content-type", "").lower():
@@ -241,8 +287,13 @@ class DouyinSession:
             if isinstance(payload, dict):
                 detail = payload.get("aweme_detail")
                 items = payload.get("aweme_list")
-                if isinstance(detail, dict): self._awemes.append(detail)
-                if isinstance(items, list): self._awemes.extend(item for item in items if isinstance(item, dict))
+                captured = ([detail] if isinstance(detail, dict) else []) + (items if isinstance(items, list) else [])
+                for item in captured:
+                    if not isinstance(item, dict):
+                        continue
+                    self._awemes.append(item)
+                    if self._target_aweme_id and str(item.get("aweme_id", "")) == self._target_aweme_id:
+                        self._target_aweme = item
         except Exception:
             return
 
@@ -324,7 +375,7 @@ def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
 def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
     author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
     desc = _clean_text(item.get("desc", ""))
-    return VideoInfo(author=author, title=_first_line(desc, 80) or "未命名作品", content=desc, url=url)
+    return VideoInfo(author=author, title=_first_line(desc, 80) or "未命名作品", content=desc, url=url, aweme_id=str(item.get("aweme_id", "")))
 
 
 def _read_profile_cards(page) -> list[dict[str, str]]:

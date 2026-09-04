@@ -107,7 +107,7 @@ class MainWindow(QMainWindow):
     def _build(self) -> None:
         self.setWindowTitle("Vidpick"); self.resize(900, 760); self.setMinimumSize(760, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
         header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch(); self.mode = QComboBox(); self.mode.addItems(["单个链接", "博主主页批量"]); self.mode.currentIndexChanged.connect(self._mode_changed); header.addWidget(self.mode); root.addLayout(header)
-        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴 douyin.com 作品分享链接"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); root.addWidget(link_group)
+        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴抖音网页版作品地址"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); root.addWidget(link_group)
         result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("详情", self.detail); root.addWidget(result)
         task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.select_works = QPushButton("选择作品"); self.select_works.setEnabled(False); self.select_works.clicked.connect(self._choose_works); top.addWidget(self.select_works); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
         log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
@@ -118,19 +118,22 @@ class MainWindow(QMainWindow):
         line = f"[{datetime.now():%H:%M:%S}] {text}"; self.mode_logs.append(self._mode_key(), line); self.logs.appendPlainText(line); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
     def _show_mode_log(self) -> None:
         self.logs.setPlainText(self.mode_logs.text(self._mode_key())); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
-    def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴 douyin.com 作品分享链接"); self._show_mode_log(); self._reset()
+    def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴抖音网页版作品地址"); self._show_mode_log(); self._reset()
     def _reset(self, *_args) -> None:
         if self.thread: return
         self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.select_works.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
     def _set_busy(self, busy: bool) -> None: self.mode.setEnabled(not busy); self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
     def _recognize(self) -> None:
+        if self.thread is not None: return
         if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return
+        self._set_busy(True)
         self._reset(); self.status.setText("识别中…"); self.step.setText("准备识别"); self.progress.setValue(5); self._log("开始识别链接"); self._run(RecognitionWorker("batch" if self.mode.currentIndex() else "single", self.url.text()))
     def _start(self) -> None:
         root = Path(__file__).resolve().parent / "output"; self.open_folder.setEnabled(False)
         if self.single: self._log("开始保存单条作品"); self._run(SaveWorker(self.single, root))
         else: self._log(f"开始批量任务：{len(self.selected)} 项"); self._run(BatchWorker(self.selected, root))
     def _run(self, worker: QObject) -> None:
+        if self.thread is not None: return
         self._set_busy(True); thread = QThread(self); worker.moveToThread(thread); self.thread = thread; self.worker = worker; thread.started.connect(worker.run); worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater); thread.finished.connect(self._finished)
         if isinstance(worker, RecognitionWorker): worker.progress.connect(self._progress_text); worker.succeeded.connect(self._recognized); worker.failed.connect(self._failed)
         elif isinstance(worker, SaveWorker): worker.progress.connect(self._save_progress); worker.succeeded.connect(self._saved); worker.failed.connect(self._failed)

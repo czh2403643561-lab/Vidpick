@@ -2,6 +2,7 @@ from pathlib import Path
 
 import main
 from douyin_parser import ProfileWork, VideoInfo
+from PySide6.QtWidgets import QApplication
 
 
 def test_mode_logs_do_not_mix() -> None:
@@ -11,6 +12,19 @@ def test_mode_logs_do_not_mix() -> None:
 
     assert logs.text("single") == "single message"
     assert logs.text("batch") == "batch message"
+
+
+def test_recognize_does_not_start_a_second_worker_when_thread_exists(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    started = []
+    monkeypatch.setattr(window, "_run", lambda worker: started.append(worker))
+    window.thread = object()
+
+    window._recognize()
+
+    assert started == []
+    window.close()
 
 
 def test_batch_worker_passes_progress_and_continues_after_one_failure(monkeypatch, tmp_path) -> None:

@@ -1,6 +1,6 @@
 import pytest
 
-from douyin_parser import DouyinParseError, _find_aweme_object, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
+from douyin_parser import DouyinParseError, DouyinSession, _find_aweme_object, canonical_work_url, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -78,17 +78,50 @@ def test_profile_cards_keep_structured_fields() -> None:
 @pytest.mark.parametrize("url, expected", [
     ("https://www.douyin.com/video/123", "123"),
     ("https://www.douyin.com/note/123", "123"),
-    ("https://www.douyin.com/user/self?from_tab_name=main&modal_id=123&showTab=like", "123"),
-    ("https://www.douyin.com/user/self?vid=123", "123"),
 ])
 def test_extract_target_aweme_id(url, expected) -> None:
     assert extract_target_aweme_id(url) == expected
+
+
+def test_extract_target_aweme_id_from_profile_vid() -> None:
+    assert extract_target_aweme_id("https://www.douyin.com/user/self?from_tab_name=main&vid=123") == "123"
+
+
+def test_extract_target_aweme_id_from_profile_modal_id() -> None:
+    assert extract_target_aweme_id("https://www.douyin.com/user/self?from_tab_name=main&modal_id=123") == "123"
+
+
+def test_canonical_work_url_uses_target_video_page_for_profile_query() -> None:
+    profile_url = "https://www.douyin.com/user/self?from_tab_name=main&vid=123"
+    assert canonical_work_url(profile_url, "123") == "https://www.douyin.com/video/123"
 
 
 def test_target_lookup_ignores_response_order() -> None:
     payload = {"aweme_list": [{"aweme_id": "111"}, {"aweme_id": "123"}, {"aweme_id": "999"}]}
     assert _find_aweme_object(payload, "123")["aweme_id"] == "123"
     assert _find_aweme_object(payload, "555") is None
+
+
+def test_response_capture_only_returns_requested_aweme() -> None:
+    class Response:
+        url = "https://www.douyin.com/aweme/v1/web/aweme/post/"
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"aweme_list": [{"aweme_id": "111"}, {"aweme_id": "123", "desc": "目标作品"}, {"aweme_id": "999"}]}
+
+    session = DouyinSession()
+    session._reset_aweme_capture("123")
+    session._capture_response(Response())
+
+    assert session._wait_for_target_aweme("123") == {"aweme_id": "123", "desc": "目标作品"}
+
+
+def test_target_html_returns_the_verified_aweme_id() -> None:
+    html = '<script type="application/json">{"aweme_list":[{"aweme_id":"123","desc":"目标正文","author":{"nickname":"测试博主"}}]}</script>'
+
+    assert parse_target_html(html, "https://www.douyin.com/video/123", "123").aweme_id == "123"
 
 
 def test_target_html_fails_closed_when_only_other_work_exists() -> None:
