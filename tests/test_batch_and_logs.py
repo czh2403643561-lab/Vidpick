@@ -33,9 +33,9 @@ def test_single_mode_hides_selection_and_busy_recognize_button_is_disabled(monke
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
     assert window.select_works.isHidden()
-    window.mode.setCurrentIndex(1)
+    window.mode_buttons["batch"].click()
     assert not window.select_works.isHidden()
-    window.mode.setCurrentIndex(0)
+    window.mode_buttons["single"].click()
     assert window.select_works.isHidden()
     assert "QPushButton#primary:disabled" in window.styleSheet()
 
@@ -45,7 +45,36 @@ def test_single_mode_hides_selection_and_busy_recognize_button_is_disabled(monke
 
     assert not window.recognize.isEnabled()
     assert not window.url.isEnabled()
-    assert not window.mode.isEnabled()
+    assert all(not button.isEnabled() for button in window.mode_buttons.values())
+    window.close()
+
+
+def test_startup_log_is_empty_and_internal_progress_is_not_logged() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+
+    assert window.logs.toPlainText() == ""
+    window._progress_text("打开作品页面")
+    window._save_progress(40, "写入作品内容")
+    window._batch_progress(1, 1, "作品", "解析正文")
+    assert window.logs.toPlainText() == ""
+
+    window._recognized(VideoInfo("测试博主", "作品", "正文", "https://www.douyin.com/video/1", "1"))
+    assert "识别成功：测试博主 / 作品" in window.logs.toPlainText()
+    window.close()
+
+
+def test_mode_logs_remain_independent_and_window_has_icon() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+
+    assert not window.windowIcon().isNull()
+    window._log("单个日志")
+    window.mode_buttons["batch"].click()
+    assert window.logs.toPlainText() == ""
+    window._log("批量日志")
+    window.mode_buttons["single"].click()
+    assert window.logs.toPlainText().endswith("单个日志")
     window.close()
 
 
