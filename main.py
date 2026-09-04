@@ -7,17 +7,18 @@ from pathlib import Path
 import sys
 import time
 
-from PySide6.QtCore import QObject, QThread, QSize, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QSize, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QButtonGroup, QScrollArea, QVBoxLayout, QWidget
 
 from douyin_parser import DouyinSession, ProfileInfo, ProfileWork, VideoInfo, extract_profile, extract_video
-from storage import get_collected_aweme_ids, is_collected, save_media, save_video
+from storage import AssetState, CollectionOptions, SelectedSaveResult, get_asset_state, save_selected_assets
 
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "vidpick-icon.ico"
 PASTE_ICON_PATH = Path(__file__).resolve().parent / "assets" / "paste.svg"
+SETTINGS_ICON_PATH = Path(__file__).resolve().parent / "assets" / "settings.svg"
 
 
 class ModeLogStore:
@@ -29,6 +30,20 @@ class ModeLogStore:
 
     def text(self, mode: str) -> str:
         return "\n".join(self._lines[mode])
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, options: CollectionOptions, parent=None) -> None:
+        super().__init__(parent); self.setWindowTitle("采集内容设置"); self.setMinimumWidth(300)
+        root = QVBoxLayout(self); group = QGroupBox("采集内容"); layout = QVBoxLayout(group)
+        self.text = QCheckBox("文案（content.txt）"); self.images = QCheckBox("图片（图文图片与封面 / 视频封面）")
+        self.text.setChecked(options.text); self.images.setChecked(options.images); layout.addWidget(self.text); layout.addWidget(self.images); root.addWidget(group)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok); self.buttons.button(QDialogButtonBox.Ok).setText("保存设置"); self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); root.addWidget(self.buttons)
+        self.text.stateChanged.connect(self._update_accept); self.images.stateChanged.connect(self._update_accept); self._update_accept()
+    def _update_accept(self) -> None:
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(self.text.isChecked() or self.images.isChecked())
+    def options(self) -> CollectionOptions:
+        return CollectionOptions(text=self.text.isChecked(), images=self.images.isChecked())
 
 
 class RecognitionWorker(QObject):
@@ -43,14 +58,12 @@ class RecognitionWorker(QObject):
 
 class SaveWorker(QObject):
     progress = Signal(int, str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
-    def __init__(self, info: VideoInfo, output_root: Path, overwrite: bool = False) -> None: super().__init__(); self.info = info; self.output_root = output_root; self.overwrite = overwrite
+    def __init__(self, info: VideoInfo, output_root: Path, options: CollectionOptions, overwrite: bool = False) -> None: super().__init__(); self.info = info; self.output_root = output_root; self.options = options; self.overwrite = overwrite
     @Slot()
     def run(self) -> None:
         try:
-            self.progress.emit(35, "写入作品正文")
-            result = save_video(self.info, self.output_root, overwrite=self.overwrite)
-            self.progress.emit(60, "准备保存作品媒体")
-            media = save_media(self.info, result[1].parent, overwrite=self.overwrite, progress=lambda step: self.progress.emit(60, step))
+            self.progress.emit(35, "准备保存所选内容")
+            result = save_selected_assets(self.info, self.output_root, self.options, overwrite=self.overwrite, progress=lambda step: self.progress.emit(60, step))
             self.progress.emit(90, "整理保存结果")
             self.succeeded.emit((result, media))
         except Exception as exc: self.failed.emit(str(exc) or "保存失败，请检查输出目录权限")
@@ -59,7 +72,7 @@ class SaveWorker(QObject):
 
 class BatchWorker(QObject):
     progress = Signal(int, int, str, str); log = Signal(str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
-    def __init__(self, works: list[ProfileWork], output_root: Path, overwrite: bool = False, skipped: int = 0) -> None: super().__init__(); self.works = works; self.output_root = output_root; self.overwrite = overwrite; self.skipped = skipped
+    def __init__(self, works: list[ProfileWork], output_root: Path, options: CollectionOptions | None = None, overwrite: bool = False, skipped: int = 0, overwrite_ids: set[str] | None = None) -> None: super().__init__(); self.works = works; self.output_root = output_root; self.options = options or CollectionOptions(); self.overwrite = overwrite; self.skipped = skipped; self.overwrite_ids = overwrite_ids if overwrite_ids is not None else ({work.aweme_id for work in works} if overwrite else set())
     @Slot()
     def run(self) -> None:
         success = failed = 0; output_dir = None; skipped = self.skipped; started = time.monotonic(); total = len(self.works)
@@ -68,15 +81,15 @@ class BatchWorker(QObject):
             for index, work in enumerate(self.works, 1):
                     self.progress.emit(index, total, work.title, "准备保存")
                     try:
-                        if _profile_work_has_complete_media(work):
-                            info = VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id, work.work_type, work.cover_url, work.image_urls, work.image_total)
+                        if _profile_work_has_complete_media(work, self.options):
+                            info = _profile_work_info(work)
                             self.progress.emit(index, total, work.title, "使用主页作品数据")
                         else:
                             if session is None: session = DouyinSession().__enter__()
                             info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
-                        output_dir, content_path, _ = save_video(info, self.output_root, overwrite=self.overwrite)
-                        media = save_media(info, content_path.parent, overwrite=self.overwrite, progress=lambda step: self.progress.emit(index, total, work.title, step))
-                        success += 1; self.log.emit(_batch_save_message(index, total, work.title, info, media))
+                        result = save_selected_assets(info, self.output_root, self.options, overwrite=work.aweme_id in self.overwrite_ids, progress=lambda step: self.progress.emit(index, total, work.title, step))
+                        output_dir = result.author_dir
+                        success += 1; self.log.emit(_batch_save_message(index, total, work.title, info, result, self.options))
                     except Exception as exc:
                         failed += 1; self.log.emit(f"保存失败 {index}/{total}：{work.title} — {str(exc) or '未知错误'}")
             self.succeeded.emit((output_dir, success, skipped, failed, time.monotonic() - started))
@@ -87,14 +100,16 @@ class BatchWorker(QObject):
 
 
 class WorksSelectionDialog(QDialog):
-    def __init__(self, profile: ProfileInfo, parent=None) -> None:
-        super().__init__(parent); self.profile = profile; self.checks: list[QCheckBox] = []; self.manager = QNetworkAccessManager(self); self.setWindowTitle(f"选择 {profile.author} 的作品"); self.resize(820, 680); self._build()
+    def __init__(self, profile: ProfileInfo, options: CollectionOptions, parent=None) -> None:
+        super().__init__(parent); self.profile = profile; self.options = options; self.checks: list[QCheckBox] = []; self.manager = QNetworkAccessManager(self); self.setWindowTitle(f"选择 {profile.author} 的作品"); self.resize(820, 680); self._build()
     def _build(self) -> None:
         root = QVBoxLayout(self); root.addWidget(QLabel(f"已识别 {len(self.profile.works)} 个当前可访问的公开作品")); scroll = QScrollArea(); scroll.setWidgetResizable(True); content = QWidget(); grid = QGridLayout(content); grid.setSpacing(12)
-        collected_ids = get_collected_aweme_ids(self.profile.author, Path(__file__).resolve().parent / "output")
+        output_root = Path(__file__).resolve().parent / "output"
         for i, work in enumerate(self.profile.works):
             card = QGroupBox(); layout = QVBoxLayout(card); image = QLabel("封面加载中"); image.setAlignment(Qt.AlignCenter); image.setFixedSize(170, 150); image.setStyleSheet("background:#eef1f5;border-radius:8px;color:#858995;"); layout.addWidget(image, alignment=Qt.AlignCenter)
-            title_text = _short(work.title, 36) + ("\n已采集" if work.aweme_id in collected_ids else "")
+            state = _profile_work_asset_state(work, output_root, self.options)
+            state_text = "已完整" if state.is_complete_for(self.options) else "待补齐" if state.has_requested_asset(self.options) else ""
+            title_text = _short(work.title, 36) + (f"\n{state_text}" if state_text else "")
             title = QLabel(title_text); title.setWordWrap(True); title.setFixedHeight(42); layout.addWidget(title); check = QCheckBox("选择"); check.stateChanged.connect(self._update_count); layout.addWidget(check); self.checks.append(check)
             if work.cover_url: self._load_cover(work.cover_url, image)
             grid.addWidget(card, i // 4, i % 4)
@@ -116,10 +131,10 @@ class WorksSelectionDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
-        super().__init__(); self.setWindowIcon(QIcon(str(ICON_PATH))); self.current_mode = "single"; self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.preview_manager = QNetworkAccessManager(self); self.preview_reply = None; self.mode_logs = ModeLogStore(); self._build(); self._style()
+        super().__init__(); self.setWindowIcon(QIcon(str(ICON_PATH))); self.current_mode = "single"; self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.preview_manager = QNetworkAccessManager(self); self.preview_reply = None; self.app_settings = QSettings("Vidpick", "Vidpick"); self.options = _load_collection_options(self.app_settings); self.mode_logs = ModeLogStore(); self._build(); self._style()
     def _build(self) -> None:
         self.setWindowTitle("Vidpick"); self.resize(980, 760); self.setMinimumSize(820, 650); central = QWidget(); central.setObjectName("central_widget"); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
-        header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch()
+        header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch(); self.settings_button = QPushButton(); self.settings_button.setObjectName("utility"); self.settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH))); self.settings_button.setIconSize(QSize(20, 20)); self.settings_button.setToolTip("采集内容设置"); self.settings_button.clicked.connect(self._edit_settings); header.addWidget(self.settings_button)
         mode_container = QWidget(); mode_container.setObjectName("mode_container"); mode_container.setFixedWidth(300); mode_layout = QHBoxLayout(mode_container); mode_layout.setContentsMargins(4, 4, 4, 4); mode_layout.setSpacing(3); self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True); self.mode_buttons: dict[str, QPushButton] = {}
         for mode, label in (("single", "单个作品"), ("batch", "博主批量")):
             button = QPushButton(label); button.setObjectName("mode_button"); button.setCheckable(True); button.setChecked(mode == self.current_mode); button.clicked.connect(lambda _checked, selected_mode=mode: self._mode_changed(selected_mode)); self.mode_group.addButton(button); self.mode_buttons[mode] = button; mode_layout.addWidget(button)
@@ -161,6 +176,11 @@ class MainWindow(QMainWindow):
         self.url.clear()
         if text:
             self.url.setText(text)
+    def _edit_settings(self) -> None:
+        dialog = SettingsDialog(self.options, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.options = dialog.options()
+            _save_collection_options(self.app_settings, self.options)
     def _work_type_text(self, info: VideoInfo) -> str:
         if info.work_type != "image":
             return "视频"
@@ -175,7 +195,7 @@ class MainWindow(QMainWindow):
         if self.current_mode == "single": self._set_preview_message("暂无预览")
     def _set_busy(self, busy: bool) -> None:
         for button in self.mode_buttons.values(): button.setEnabled(not busy)
-        self.url.setEnabled(not busy); self.paste_button.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
+        self.url.setEnabled(not busy); self.paste_button.setEnabled(not busy); self.recognize.setEnabled(not busy); self.settings_button.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
     def _recognize(self) -> None:
         if self.thread is not None: return
         if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return
@@ -187,34 +207,39 @@ class MainWindow(QMainWindow):
         if self.thread is not None: return
         root = Path(__file__).resolve().parent / "output"; self.open_folder.setEnabled(False)
         if self.single:
-            duplicate = is_collected(self.single.author, self.single.aweme_id, root)
-            if duplicate:
-                box = QMessageBox(QMessageBox.Warning, "重复作品", "这个作品之前已经采集过。", parent=self)
-                overwrite_button = box.addButton("覆盖原内容", QMessageBox.AcceptRole)
+            state = get_asset_state(self.single, root)
+            overwrite = False
+            if state.is_complete_for(self.options):
+                box = QMessageBox(QMessageBox.Warning, "重复作品", "这个作品所选内容已经采集过。", parent=self)
+                overwrite_button = box.addButton("覆盖所选内容", QMessageBox.AcceptRole)
                 box.addButton("取消任务", QMessageBox.RejectRole)
                 box.exec()
                 if box.clickedButton() is not overwrite_button:
                     self.status.setText("已取消"); self.step.setText("本次任务已取消"); return
-            self._run(SaveWorker(self.single, root, overwrite=duplicate))
+                overwrite = True
+            self._run(SaveWorker(self.single, root, self.options, overwrite=overwrite))
             return
         if not self.selected: return
-        author = self.profile.author if self.profile else ""
-        duplicates = [work for work in self.selected if is_collected(author or work.author, work.aweme_id, root)]
-        overwrite = False; skipped = 0; works = self.selected
-        if duplicates:
-            box = QMessageBox(QMessageBox.Warning, "发现重复作品", f"已选择 {len(self.selected)} 个作品，其中 {len(duplicates)} 个之前已经采集。", parent=self)
+        states = {work.aweme_id: _profile_work_asset_state(work, root, self.options) for work in self.selected}
+        complete = [work for work in self.selected if states[work.aweme_id].is_complete_for(self.options)]
+        partial = [work for work in self.selected if not states[work.aweme_id].is_complete_for(self.options) and states[work.aweme_id].has_requested_asset(self.options)]
+        new = [work for work in self.selected if not states[work.aweme_id].has_requested_asset(self.options)]
+        overwrite_ids: set[str] = set(); skipped = 0; works = self.selected
+        if complete:
+            message = f"已选择 {len(self.selected)} 个作品：\n需要新采集 {len(new)} 个\n需要补齐 {len(partial)} 个\n所选内容已完整 {len(complete)} 个"
+            box = QMessageBox(QMessageBox.Warning, "发现已完整作品", message, parent=self)
             skip_button = box.addButton("跳过重复作品并继续", QMessageBox.AcceptRole)
             overwrite_button = box.addButton("覆盖重复作品并继续", QMessageBox.DestructiveRole)
             box.addButton("返回", QMessageBox.RejectRole)
             box.setDefaultButton(skip_button)
             box.exec()
             if box.clickedButton() is skip_button:
-                duplicate_ids = {work.aweme_id for work in duplicates}; works = [work for work in self.selected if work.aweme_id not in duplicate_ids]; skipped = len(duplicates)
+                complete_ids = {work.aweme_id for work in complete}; works = [work for work in self.selected if work.aweme_id not in complete_ids]; skipped = len(complete)
             elif box.clickedButton() is overwrite_button:
-                overwrite = True
+                overwrite_ids = {work.aweme_id for work in complete}
             else:
                 self.step.setText("已返回，未启动任务"); return
-        self._run(BatchWorker(works, root, overwrite=overwrite, skipped=skipped))
+        self._run(BatchWorker(works, root, self.options, overwrite=bool(overwrite_ids), skipped=skipped, overwrite_ids=overwrite_ids))
     def _run(self, worker: QObject) -> None:
         if self.thread is not None: return
         self._set_busy(True); thread = QThread(self); worker.moveToThread(thread); self.thread = thread; self.worker = worker; thread.started.connect(worker.run); worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater); thread.finished.connect(self._finished)
@@ -234,7 +259,7 @@ class MainWindow(QMainWindow):
             self.profile = result; self.preview_card.setVisible(False); self.select_works.setVisible(True); self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.work_type.setText("—"); self.detail.setText("请选择要采集的作品"); self.status.setText("成功"); self.select_works.setEnabled(True); self._log(f"识别成功：{result.author}，共 {len(result.works)} 个作品"); self._choose_works()
     def _choose_works(self) -> None:
         if not self.profile: return
-        dialog = WorksSelectionDialog(self.profile, self)
+        dialog = WorksSelectionDialog(self.profile, self.options, self)
         if dialog.exec() == QDialog.Accepted:
             self.selected = dialog.selected(); self.summary.setText(f"识别到 {len(self.profile.works)} 个公开作品，已选择 {len(self.selected)} 项"); self.detail.setText("已选择作品，点击“开始任务”后顺序采集"); self.step.setText("选择完成，可以开始任务"); self.select_works.setText(f"重新选择（已选 {len(self.selected)}）"); self.start.setEnabled(True)
         else: self.step.setText("可点击“选择作品”重新打开")
@@ -242,22 +267,8 @@ class MainWindow(QMainWindow):
     def _batch_progress(self, index: int, total: int, title: str, step: str) -> None: self.progress.setValue(int((index - 1) * 100 / total)); self.step.setText(f"当前 {index}/{total}：{_short(title, 36)} — {step}")
     @Slot(object)
     def _saved(self, result: object) -> None:
-        save_result, media = result; self.output_dir, content_path, when = save_result; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True)
-        title = self.single.title if self.single else content_path.parent.name
-        if self.single and self.single.work_type == "image":
-            if media.total and media.saved == media.total:
-                message = f"保存成功：{title} · 正文 + {media.saved} 张无水印图片"
-            elif media.saved:
-                message = f"保存完成：{title} · 正文成功，无水印图片 {media.saved}/{media.total}"
-            else:
-                message = f"保存完成：{title} · 正文成功，未获取到可靠的无水印图片源"
-        elif media.cover_saved:
-            message = f"保存成功：{title} · 正文 + 封面"
-        elif self.single and self.single.cover_url:
-            message = f"保存完成：{title} · 正文成功，封面未保存"
-        else:
-            message = f"保存成功：{title} · 正文"
-        self._log(message)
+        saved = result; self.output_dir = saved.author_dir; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True)
+        self._log(_selected_save_message(self.single.title if self.single else saved.work_dir.name, self.single, saved, self.options))
     @Slot(object)
     def _batch_done(self, result: object) -> None:
         folder, success, skipped, failed, elapsed = result; self.output_dir = folder; self.progress.setValue(100); self.status.setText("完成" if not failed else "完成（含失败项）"); self.step.setText(f"批量完成：成功 {success} / 跳过 {skipped} / 失败 {failed}"); self.open_folder.setEnabled(folder is not None); self._log(f"批量完成：成功 {success}，跳过 {skipped}，失败 {failed}，耗时 {elapsed:.1f} 秒")
@@ -276,23 +287,60 @@ class MainWindow(QMainWindow):
 
 
 def _short(value: str, size: int) -> str: return value[:size] + ("…" if len(value) > size else "")
-def _profile_work_has_complete_media(work: ProfileWork) -> bool:
-    if not work.desc:
+def _load_collection_options(settings: QSettings) -> CollectionOptions:
+    text = settings.value("collect_text", True, type=bool); images = settings.value("collect_images", True, type=bool)
+    return CollectionOptions(text=text, images=images) if text or images else CollectionOptions()
+def _save_collection_options(settings: QSettings, options: CollectionOptions) -> None:
+    settings.setValue("collect_text", options.text); settings.setValue("collect_images", options.images); settings.sync()
+def _profile_work_info(work: ProfileWork) -> VideoInfo:
+    return VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url, work.aweme_id, work.work_type or "video", work.cover_url, work.image_urls, work.image_total)
+def _profile_work_has_complete_media(work: ProfileWork, options: CollectionOptions) -> bool:
+    if options.text and not work.desc:
         return False
+    if not options.images:
+        return True
     if work.work_type == "image":
         return bool(work.image_total and len(work.image_urls) == work.image_total and work.cover_url == work.image_urls[0])
     return work.work_type == "video" and bool(work.cover_url)
-def _batch_save_message(index: int, total: int, title: str, info: VideoInfo, media) -> str:
-    prefix = f"{index}/{total}：{title}"
+def _profile_work_asset_state(work: ProfileWork, output_root: Path, options: CollectionOptions) -> AssetState:
+    state = get_asset_state(_profile_work_info(work), output_root)
+    media_options = CollectionOptions(text=False, images=True)
+    return AssetState(state.text, False) if options.images and not _profile_work_has_complete_media(work, media_options) else state
+def _image_phrase(info: VideoInfo, saved: SelectedSaveResult) -> tuple[bool, str]:
+    media = saved.media
     if info.work_type == "image":
         if media.total and media.saved == media.total:
-            return f"保存成功 {prefix} · 正文 + {media.saved} 张无水印图片"
+            return True, f"{media.saved} 张图片"
         if media.saved:
-            return f"保存完成 {prefix} · 正文成功，无水印图片 {media.saved}/{media.total}"
-        return f"保存完成 {prefix} · 正文成功，未获取到可靠无水印图片"
+            return False, f"无水印图片 {media.saved}/{media.total}"
+        return False, "未获取到可靠无水印图片"
     if media.cover_saved:
-        return f"保存成功 {prefix} · 正文 + 封面"
-    return f"保存成功 {prefix} · 正文"
+        return True, "封面"
+    return False, "封面未保存" if info.cover_url else "未获取到可靠图片来源"
+def _selected_save_message(title: str, info: VideoInfo | None, saved: SelectedSaveResult, options: CollectionOptions) -> str:
+    if info is None:
+        return f"保存成功：{title}"
+    complete_media, image_phrase = _image_phrase(info, saved)
+    topping_up = saved.before.has_requested_asset(options) and not saved.before.is_complete_for(options)
+    if topping_up:
+        additions = []
+        if options.text and not saved.before.text and saved.after.text:
+            additions.append("新增文案")
+        if options.images and not saved.before.images:
+            additions.append(f"新增 {saved.media.newly_saved} 张图片" if info.work_type == "image" and complete_media else image_phrase)
+        return f"补齐完成：{title} · {' + '.join(additions) or '所选内容'}"
+    if options.images and not complete_media:
+        text_part = "文案成功，" if options.text and saved.after.text else ""
+        return f"保存完成：{title} · {text_part}{image_phrase}"
+    parts = []
+    if options.text and saved.after.text:
+        parts.append("文案")
+    if options.images:
+        parts.append(image_phrase)
+    return f"保存成功：{title} · {' + '.join(parts)}"
+def _batch_save_message(index: int, total: int, title: str, info: VideoInfo, saved: SelectedSaveResult, options: CollectionOptions) -> str:
+    message = _selected_save_message(title, info, saved, options)
+    return message.replace("：", f" {index}/{total}：", 1)
 def run() -> int:
     app = QApplication(sys.argv); app.setApplicationName("Vidpick"); app.setWindowIcon(QIcon(str(ICON_PATH))); window = MainWindow(); window.show(); return app.exec()
 if __name__ == "__main__": raise SystemExit(run())

@@ -29,6 +29,40 @@ class MediaSaveResult:
     total: int = 0
     saved: int = 0
     cover_saved: bool = False
+    newly_saved: int = 0
+
+
+@dataclass(frozen=True)
+class CollectionOptions:
+    text: bool = True
+    images: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.text and not self.images:
+            raise StorageError("至少选择文案或图片其中一项")
+
+
+@dataclass(frozen=True)
+class AssetState:
+    text: bool = False
+    images: bool = False
+
+    def is_complete_for(self, options: CollectionOptions) -> bool:
+        return (not options.text or self.text) and (not options.images or self.images)
+
+    def has_requested_asset(self, options: CollectionOptions) -> bool:
+        return (options.text and self.text) or (options.images and self.images)
+
+
+@dataclass(frozen=True)
+class SelectedSaveResult:
+    author_dir: Path
+    work_dir: Path
+    before: AssetState
+    after: AssetState
+    text_saved: bool
+    media: MediaSaveResult
+    collected_at: str
 
 
 def safe_filename(value: str, fallback: str, max_length: int = 100) -> str:
@@ -123,6 +157,74 @@ def _resolved_info(info: VideoInfo) -> VideoInfo:
     return info if info.aweme_id == aweme_id else replace(info, aweme_id=aweme_id)
 
 
+def _work_paths(info: VideoInfo, output_root: str | Path) -> tuple[VideoInfo, Path, Path]:
+    info = _resolved_info(info)
+    author_dir = get_author_dir(info.author, output_root)
+    work_dir = _find_work_dir(author_dir, info.aweme_id) or get_work_dir(info.author, info.title, info.aweme_id, output_root)
+    return info, author_dir, work_dir
+
+
+def get_asset_state(info: VideoInfo, output_root: str | Path = "output") -> AssetState:
+    """Read the actually available assets, never trusting JSONL alone."""
+
+    info, _author_dir, work_dir = _work_paths(info, output_root)
+    text = (work_dir / "content.txt").is_file()
+    if info.work_type == "image":
+        expected = info.image_total or len(info.image_urls)
+        image_dir = work_dir / "images"
+        managed = [path for path in image_dir.glob("*.*") if path.is_file() and re.fullmatch(r"\d+", path.stem)] if image_dir.is_dir() else []
+        images = bool(expected and len(managed) >= expected and _cover_path(work_dir) is not None)
+    else:
+        images = _cover_path(work_dir) is not None
+    return AssetState(text=text, images=images)
+
+
+def save_selected_assets(
+    info: VideoInfo,
+    output_root: str | Path,
+    options: CollectionOptions,
+    *,
+    overwrite: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> SelectedSaveResult:
+    """Save only requested resources and merge their real state into JSONL."""
+
+    info, author_dir, work_dir = _work_paths(info, output_root)
+    author_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    before = get_asset_state(info, output_root)
+    text_saved = False
+    if options.text and (overwrite or not before.text):
+        (work_dir / "content.txt").write_text(info.content + "\n", encoding="utf-8", newline="\n")
+        text_saved = True
+
+    media = MediaSaveResult()
+    if options.images and (overwrite or not before.images):
+        media = save_media(info, work_dir, overwrite=overwrite, only_missing=not overwrite, progress=progress)
+    elif options.images:
+        media = _existing_media_result(info, work_dir)
+
+    after = get_asset_state(info, output_root)
+    collected_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    _upsert_selected_record(author_dir, info, after, collected_at, text_saved=text_saved)
+    return SelectedSaveResult(author_dir.resolve(), work_dir.resolve(), before, after, text_saved, media, collected_at)
+
+
+def _upsert_selected_record(author_dir: Path, info: VideoInfo, state: AssetState, collected_at: str, *, text_saved: bool) -> None:
+    old = next((record for record in _records(author_dir) if aweme_id_from_record(record) == info.aweme_id), {})
+    record = dict(old)
+    current = asdict(info)
+    for key in ("aweme_id", "author", "title", "url", "work_type", "cover_url", "image_urls", "image_total"):
+        record[key] = current[key]
+    if text_saved:
+        record["content"] = info.content
+    elif "content" not in old:
+        record.pop("content", None)
+    record["saved_assets"] = {"text": state.text, "images": state.images}
+    record["collected_at"] = collected_at
+    upsert_jsonl(author_dir, record)
+
+
 def upsert_jsonl(author_dir: Path, record: dict[str, Any]) -> None:
     """Upsert one ID while preserving legacy records with no reliable ID."""
 
@@ -179,6 +281,7 @@ def save_media(
     work_dir: Path,
     *,
     overwrite: bool = False,
+    only_missing: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> MediaSaveResult:
     """Download only Vidpick-managed media without risking the saved正文."""
@@ -194,25 +297,35 @@ def save_media(
         image_dir = work_dir / "images"
         image_dir.mkdir(exist_ok=True)
         saved = 0
+        newly_saved = 0
         first_image: Path | None = None
         for index, url in enumerate(info.image_urls, 1):
+            existing = _managed_image_path(image_dir, index) if only_missing else None
+            if existing is not None:
+                saved += 1
+                if index == 1:
+                    first_image = existing
+                continue
             report(f"下载无水印图片 {index}/{len(info.image_urls)}")
             try:
                 image_path = _download_to_stem(url, image_dir / f"{index:02d}")
             except Exception:
                 continue
             saved += 1
+            newly_saved += 1
             if index == 1:
                 first_image = image_path
-        if first_image is not None:
+        if first_image is not None and (overwrite or _cover_path(work_dir) is None):
             _copy_as_cover(first_image, work_dir)
-        return MediaSaveResult(total=total, saved=saved, cover_saved=first_image is not None)
+        return MediaSaveResult(total=total, saved=saved, cover_saved=_cover_path(work_dir) is not None, newly_saved=newly_saved)
 
     if info.cover_url:
+        if only_missing and _cover_path(work_dir) is not None:
+            return MediaSaveResult(total=1, saved=1, cover_saved=True)
         report("下载作品封面")
         try:
             _download_to_stem(info.cover_url, work_dir / "cover")
-            return MediaSaveResult(total=1, saved=1, cover_saved=True)
+            return MediaSaveResult(total=1, saved=1, cover_saved=True, newly_saved=1)
         except Exception:
             return MediaSaveResult(total=1, saved=0, cover_saved=False)
     return MediaSaveResult()
@@ -225,6 +338,23 @@ def _clear_managed_media(work_dir: Path) -> None:
     image_dir = work_dir / "images"
     if image_dir.exists() and image_dir.is_dir():
         shutil.rmtree(image_dir)
+
+
+def _managed_image_path(image_dir: Path, index: int) -> Path | None:
+    return next((path for path in image_dir.glob(f"{index:02d}.*") if path.is_file()), None)
+
+
+def _cover_path(work_dir: Path) -> Path | None:
+    return next((path for path in work_dir.glob("cover.*") if path.is_file()), None)
+
+
+def _existing_media_result(info: VideoInfo, work_dir: Path) -> MediaSaveResult:
+    if info.work_type == "image":
+        total = info.image_total or len(info.image_urls)
+        image_dir = work_dir / "images"
+        saved = sum(_managed_image_path(image_dir, index) is not None for index in range(1, total + 1)) if image_dir.is_dir() else 0
+        return MediaSaveResult(total=total, saved=saved, cover_saved=_cover_path(work_dir) is not None)
+    return MediaSaveResult(total=1, saved=1 if _cover_path(work_dir) is not None else 0, cover_saved=_cover_path(work_dir) is not None) if info.cover_url else MediaSaveResult()
 
 
 def _copy_as_cover(source: Path, work_dir: Path) -> None:

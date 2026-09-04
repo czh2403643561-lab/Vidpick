@@ -4,7 +4,7 @@ import pytest
 
 from douyin_parser import VideoInfo
 import storage
-from storage import AlreadyCollectedError, get_author_dir, get_work_dir, is_collected, save_media, save_video, safe_filename
+from storage import AlreadyCollectedError, AssetState, CollectionOptions, get_asset_state, get_author_dir, get_work_dir, is_collected, save_media, save_selected_assets, save_video, safe_filename
 
 
 def test_safe_filename_handles_windows_names() -> None:
@@ -169,3 +169,94 @@ def test_save_video_media_only_downloads_cover(monkeypatch, tmp_path) -> None:
     assert calls == ["https://cover/video.jpg"]
     assert (work_dir / "cover.jpg").exists()
     assert not (work_dir / "images").exists()
+
+
+def test_selected_assets_support_text_only_and_images_only(monkeypatch, tmp_path) -> None:
+    def fake_download(url, stem):
+        path = stem.with_suffix(".webp")
+        path.write_bytes(url.encode())
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    image_info = VideoInfo(
+        "测试博主", "图文", "正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", cover_url="https://clean/01", image_urls=("https://clean/01", "https://clean/02"), image_total=2,
+    )
+    text_result = save_selected_assets(image_info, tmp_path, CollectionOptions(text=True, images=False))
+    assert (text_result.work_dir / "content.txt").exists()
+    assert not (text_result.work_dir / "images").exists()
+    assert not list(text_result.work_dir.glob("cover.*"))
+
+    image_only = VideoInfo(
+        "测试博主", "图文二", "不应写入", "https://www.douyin.com/note/2", "2",
+        work_type="image", cover_url="https://clean/01", image_urls=("https://clean/01", "https://clean/02"), image_total=2,
+    )
+    image_result = save_selected_assets(image_only, tmp_path, CollectionOptions(text=False, images=True))
+    assert not (image_result.work_dir / "content.txt").exists()
+    assert len(list((image_result.work_dir / "images").iterdir())) == 2
+    assert len(list(image_result.work_dir.glob("cover.*"))) == 1
+    assert get_asset_state(image_only, tmp_path).images
+    record = next(json.loads(line) for line in (image_result.author_dir / "data.jsonl").read_text(encoding="utf-8").splitlines() if '"2"' in line)
+    assert record["saved_assets"] == {"text": False, "images": True}
+    assert "content" not in record
+
+
+def test_selected_assets_fill_missing_without_rewriting_and_merge_jsonl(monkeypatch, tmp_path) -> None:
+    downloads = []
+
+    def fake_download(url, stem):
+        downloads.append(url)
+        path = stem.with_suffix(".webp")
+        path.write_bytes(f"image-{len(downloads)}".encode())
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    info = VideoInfo(
+        "测试博主", "图文", "第一次正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", cover_url="https://clean/01", image_urls=("https://clean/01", "https://clean/02"), image_total=2,
+    )
+    first = save_selected_assets(info, tmp_path, CollectionOptions(text=True, images=False))
+    second = save_selected_assets(info, tmp_path, CollectionOptions(text=True, images=True))
+    assert second.before.text and not second.before.images
+    assert not second.text_saved
+    assert second.media.newly_saved == 2
+    assert (second.work_dir / "content.txt").read_text(encoding="utf-8") == "第一次正文\n"
+
+    image_bytes = (second.work_dir / "images" / "01.webp").read_bytes()
+    updated = VideoInfo(
+        "测试博主", "图文", "第二次正文", info.url, "1",
+        work_type="image", cover_url=info.cover_url, image_urls=info.image_urls, image_total=2,
+    )
+    third = save_selected_assets(updated, tmp_path, CollectionOptions(text=True, images=True))
+    assert third.before.text and third.before.images
+    assert not third.text_saved and third.media.newly_saved == 0
+    assert (third.work_dir / "images" / "01.webp").read_bytes() == image_bytes
+    record = json.loads((third.author_dir / "data.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert record["content"] == "第一次正文"
+    assert record["saved_assets"] == {"text": True, "images": True}
+
+
+def test_selected_overwrite_only_changes_requested_asset(monkeypatch, tmp_path) -> None:
+    def fake_download(url, stem):
+        path = stem.with_suffix(".webp")
+        path.write_bytes(b"new-media")
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    original = VideoInfo("测试博主", "图文", "旧正文", "https://www.douyin.com/note/1", "1", "image", "https://clean/01", ("https://clean/01",), 1)
+    saved = save_selected_assets(original, tmp_path, CollectionOptions())
+    old_image = (saved.work_dir / "images" / "01.webp").read_bytes()
+    changed = VideoInfo("测试博主", "图文", "新正文", original.url, "1", "image", original.cover_url, original.image_urls, 1)
+    text_overwrite = save_selected_assets(changed, tmp_path, CollectionOptions(text=True, images=False), overwrite=True)
+    assert (text_overwrite.work_dir / "content.txt").read_text(encoding="utf-8") == "新正文\n"
+    assert (text_overwrite.work_dir / "images" / "01.webp").read_bytes() == old_image
+    media_overwrite = save_selected_assets(original, tmp_path, CollectionOptions(text=False, images=True), overwrite=True)
+    assert (media_overwrite.work_dir / "content.txt").read_text(encoding="utf-8") == "新正文\n"
+    assert (media_overwrite.work_dir / "images" / "01.webp").read_bytes() == b"new-media"
+
+
+def test_asset_state_is_complete_only_for_requested_options() -> None:
+    state = AssetState(text=True, images=False)
+    assert state.is_complete_for(CollectionOptions(text=True, images=False))
+    assert not state.is_complete_for(CollectionOptions(text=True, images=True))
+    assert state.has_requested_asset(CollectionOptions(text=True, images=True))

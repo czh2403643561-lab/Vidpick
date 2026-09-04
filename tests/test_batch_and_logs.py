@@ -4,8 +4,9 @@ import pytest
 
 import main
 from douyin_parser import ProfileWork, VideoInfo
-from storage import MediaSaveResult
-from PySide6.QtWidgets import QApplication
+from storage import AssetState, CollectionOptions, MediaSaveResult, SelectedSaveResult
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
 
 def test_mode_logs_do_not_mix() -> None:
@@ -15,6 +16,21 @@ def test_mode_logs_do_not_mix() -> None:
 
     assert logs.text("single") == "single message"
     assert logs.text("batch") == "batch message"
+
+
+def test_collection_options_persist_and_settings_require_one_choice(tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    main._save_collection_options(settings, CollectionOptions(text=False, images=True))
+    assert main._load_collection_options(settings) == CollectionOptions(text=False, images=True)
+
+    app = QApplication.instance() or QApplication([])
+    dialog = main.SettingsDialog(CollectionOptions())
+    dialog.text.setChecked(False)
+    dialog.images.setChecked(False)
+    assert not dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
+    dialog.text.setChecked(True)
+    assert dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
+    dialog.close()
 
 
 def test_recognize_does_not_start_a_second_worker_when_thread_exists(monkeypatch) -> None:
@@ -178,9 +194,9 @@ def test_single_save_log_reports_partial_image_download() -> None:
         work_type="image", image_urls=("https://image/1.webp", "https://image/2.webp"),
     )
 
-    window._saved(((Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1" / "content.txt", "2026-09-04"), MediaSaveResult(total=2, saved=1, cover_saved=True)))
+    window._saved(SelectedSaveResult(Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1", AssetState(), AssetState(text=True), True, MediaSaveResult(total=2, saved=1, cover_saved=True), "2026-09-04"))
 
-    assert "保存完成：图文作品 · 正文成功，无水印图片 1/2" in window.logs.toPlainText()
+    assert "保存完成：图文作品 · 文案成功，无水印图片 1/2" in window.logs.toPlainText()
     window.close()
 
 
@@ -192,9 +208,9 @@ def test_single_save_log_marks_risky_only_image_source_as_unavailable() -> None:
         work_type="image", image_total=1,
     )
 
-    window._saved(((Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1" / "content.txt", "2026-09-04"), MediaSaveResult(total=1, saved=0)))
+    window._saved(SelectedSaveResult(Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1", AssetState(), AssetState(text=True), True, MediaSaveResult(total=1, saved=0), "2026-09-04"))
 
-    assert "保存完成：图文作品 · 正文成功，未获取到可靠的无水印图片源" in window.logs.toPlainText()
+    assert "保存完成：图文作品 · 文案成功，未获取到可靠无水印图片" in window.logs.toPlainText()
     window.close()
 
 
@@ -234,7 +250,7 @@ def test_single_duplicate_cancel_or_overwrite_is_handled_in_ui(monkeypatch) -> N
     window = main.MainWindow()
     window.single = VideoInfo("测试博主", "作品", "正文", "https://www.douyin.com/video/123", "123")
     started = []
-    monkeypatch.setattr(main, "is_collected", lambda *_args: True)
+    monkeypatch.setattr(main, "get_asset_state", lambda *_args: AssetState(text=True, images=True))
     monkeypatch.setattr(main, "QMessageBox", FakeMessageBox)
     monkeypatch.setattr(window, "_run", lambda worker: started.append(worker))
 
@@ -258,13 +274,14 @@ def test_batch_duplicate_summary_actions(monkeypatch, choice, expected_ids, over
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
     window.profile = main.ProfileInfo("测试博主", "https://www.douyin.com/user/test", ())
+    window.options = CollectionOptions(text=True, images=False)
     window.selected = [
         ProfileWork("https://www.douyin.com/video/1", "", "旧", "1", "测试博主", "旧正文"),
         ProfileWork("https://www.douyin.com/video/2", "", "新", "2", "测试博主", "新正文"),
     ]
     started = []
     FakeMessageBox.choice = choice
-    monkeypatch.setattr(main, "is_collected", lambda _author, aweme_id, _root: aweme_id == "1")
+    monkeypatch.setattr(main, "get_asset_state", lambda info, *_args: AssetState(text=info.aweme_id == "1"))
     monkeypatch.setattr(main, "QMessageBox", FakeMessageBox)
     monkeypatch.setattr(window, "_run", lambda worker: started.append(worker))
 
@@ -296,15 +313,15 @@ def test_batch_worker_passes_progress_and_continues_after_one_failure(monkeypatc
                 raise RuntimeError("页面不可用")
             return VideoInfo("测试博主", "测试作品", "正文", url)
 
-    def fake_save(info, root, overwrite=False):
+    def fake_save(info, root, options, overwrite=False, progress=None):
         folder = Path(root) / info.author
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{len(calls)}.txt"
+        path = folder / f"{len(calls)}"
         path.write_text(info.content, encoding="utf-8")
-        return folder, path, "2026-01-01T00:00:00+08:00"
+        return SelectedSaveResult(folder, path, AssetState(), AssetState(text=True), True, MediaSaveResult(), "2026-01-01T00:00:00+08:00")
 
     monkeypatch.setattr(main, "DouyinSession", FakeSession)
-    monkeypatch.setattr(main, "save_video", fake_save)
+    monkeypatch.setattr(main, "save_selected_assets", fake_save)
     worker = main.BatchWorker(
         [
             ProfileWork("https://www.douyin.com/video/good-1", "", "第一项"),
@@ -335,26 +352,20 @@ def test_batch_worker_saves_complete_profile_media_without_browser(monkeypatch, 
     monkeypatch.setattr(main, "DouyinSession", UnexpectedSession)
     captured = []
 
-    def fake_save(info, root, overwrite=False):
-        captured.append(("text", info, overwrite))
+    def fake_save(info, root, options, overwrite=False, progress=None):
+        captured.append(("selected", info, overwrite))
         folder = Path(root) / info.author / "标题__1"
         folder.mkdir(parents=True)
-        path = folder / "content.txt"
-        path.write_text(info.content, encoding="utf-8")
-        return folder.parent, path, "2026-01-01T00:00:00+08:00"
-
-    def fake_media(info, work_dir, overwrite=False, progress=None):
-        captured.append(("media", info, overwrite))
-        image_dir = work_dir / "images"
+        (folder / "content.txt").write_text(info.content, encoding="utf-8")
+        image_dir = folder / "images"
         image_dir.mkdir()
         first = image_dir / "01.webp"
         first.write_bytes(b"clean")
         (image_dir / "02.webp").write_bytes(b"clean")
-        (work_dir / "cover.webp").write_bytes(first.read_bytes())
-        return MediaSaveResult(total=2, saved=2, cover_saved=True)
+        (folder / "cover.webp").write_bytes(first.read_bytes())
+        return SelectedSaveResult(folder.parent, folder, AssetState(), AssetState(text=True, images=True), True, MediaSaveResult(total=2, saved=2, cover_saved=True, newly_saved=2), "2026-01-01T00:00:00+08:00")
 
-    monkeypatch.setattr(main, "save_video", fake_save)
-    monkeypatch.setattr(main, "save_media", fake_media)
+    monkeypatch.setattr(main, "save_selected_assets", fake_save)
     work = ProfileWork(
         "https://www.douyin.com/note/1", "https://clean.example/01.webp", "标题", "1", "博主", "完整正文",
         work_type="image", image_urls=("https://clean.example/01.webp", "https://clean.example/02.webp"), image_total=2,
@@ -369,13 +380,13 @@ def test_batch_worker_saves_complete_profile_media_without_browser(monkeypatch, 
     folder, success, skipped, failed, _ = completed[0]
     assert folder.name == "博主"
     assert (success, skipped, failed) == (1, 0, 0)
-    assert [kind for kind, *_ in captured] == ["text", "media"]
+    assert [kind for kind, *_ in captured] == ["selected"]
     saved_info = captured[0][1]
     assert saved_info.image_urls == work.image_urls
     assert saved_info.cover_url == work.image_urls[0]
     assert (folder / "标题__1" / "images" / "01.webp").exists()
     assert (folder / "标题__1" / "cover.webp").read_bytes() == b"clean"
-    assert "保存成功 1/1：标题 · 正文 + 2 张无水印图片" in logs
+    assert "保存成功 1/1：标题 · 文案 + 2 张图片" in logs
 
 
 def test_batch_worker_fetches_detail_only_when_profile_media_is_incomplete(monkeypatch, tmp_path) -> None:
@@ -395,16 +406,16 @@ def test_batch_worker_fetches_detail_only_when_profile_media_is_incomplete(monke
                 "https://clean.example/01.webp", ("https://clean.example/01.webp", "https://clean.example/02.webp"), 2,
             )
 
-    def fake_save(info, root, overwrite=False):
+    def fake_save(info, root, options, overwrite=False, progress=None):
         folder = Path(root) / info.author
         folder.mkdir(parents=True)
-        path = folder / "content.txt"
-        path.write_text(info.content, encoding="utf-8")
-        return folder, path, "2026-01-01T00:00:00+08:00"
+        path = folder / "作品__1"
+        path.mkdir()
+        (path / "content.txt").write_text(info.content, encoding="utf-8")
+        return SelectedSaveResult(folder, path, AssetState(), AssetState(text=True), True, MediaSaveResult(total=2, saved=1, cover_saved=True, newly_saved=1), "2026-01-01T00:00:00+08:00")
 
     monkeypatch.setattr(main, "DouyinSession", FakeSession)
-    monkeypatch.setattr(main, "save_video", fake_save)
-    monkeypatch.setattr(main, "save_media", lambda info, *_args, **_kwargs: MediaSaveResult(total=2, saved=1, cover_saved=True))
+    monkeypatch.setattr(main, "save_selected_assets", fake_save)
     work = ProfileWork(
         "https://www.douyin.com/note/1", "https://clean.example/01.webp", "标题", "1", "博主", "主页正文",
         work_type="image", image_urls=("https://clean.example/01.webp",), image_total=2,
@@ -418,4 +429,4 @@ def test_batch_worker_fetches_detail_only_when_profile_media_is_incomplete(monke
 
     assert calls == [work.url]
     assert completed[0][1:4] == (1, 0, 0)
-    assert "保存完成 1/1：标题 · 正文成功，无水印图片 1/2" in logs
+    assert "保存完成 1/1：标题 · 文案成功，无水印图片 1/2" in logs
