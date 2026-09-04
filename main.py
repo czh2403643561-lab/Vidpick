@@ -54,18 +54,25 @@ class BatchWorker(QObject):
     @Slot()
     def run(self) -> None:
         success = failed = 0; output_dir = None; started = time.monotonic(); total = len(self.works)
+        session = None
         try:
-            with DouyinSession() as session:
-                for index, work in enumerate(self.works, 1):
-                    self.progress.emit(index, total, work.title, "打开作品页面")
+            for index, work in enumerate(self.works, 1):
+                    self.progress.emit(index, total, work.title, "准备保存")
                     try:
-                        info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
+                        if work.desc:
+                            info = VideoInfo(work.author or "未命名博主", work.title, work.desc, work.url)
+                            self.progress.emit(index, total, work.title, "使用主页作品正文")
+                        else:
+                            if session is None: session = DouyinSession().__enter__()
+                            info = session.extract_video(work.url, lambda step: self.progress.emit(index, total, work.title, step))
                         output_dir, txt_path, _ = save_video(info, self.output_root); success += 1; self.log.emit(f"成功 {index}/{total}：{txt_path.name}")
                     except Exception as exc:
                         failed += 1; self.log.emit(f"失败 {index}/{total}：{work.title} — {str(exc) or '未知错误'}")
             self.succeeded.emit((output_dir, success, failed, time.monotonic() - started))
         except Exception as exc: self.failed.emit(str(exc) or "批量任务无法启动")
-        finally: self.finished.emit()
+        finally:
+            if session is not None: session.__exit__(None, None, None)
+            self.finished.emit()
 
 
 class WorksSelectionDialog(QDialog):
@@ -102,7 +109,7 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch(); self.mode = QComboBox(); self.mode.addItems(["单个链接", "博主主页批量"]); self.mode.currentIndexChanged.connect(self._mode_changed); header.addWidget(self.mode); root.addLayout(header)
         link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴 douyin.com 作品分享链接"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); root.addWidget(link_group)
         result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("详情", self.detail); root.addWidget(result)
-        task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
+        task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.select_works = QPushButton("选择作品"); self.select_works.setEnabled(False); self.select_works.clicked.connect(self._choose_works); top.addWidget(self.select_works); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
         log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
     def _style(self) -> None:
         self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit,QComboBox{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
@@ -114,8 +121,8 @@ class MainWindow(QMainWindow):
     def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴 douyin.com 作品分享链接"); self._show_mode_log(); self._reset()
     def _reset(self, *_args) -> None:
         if self.thread: return
-        self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
-    def _set_busy(self, busy: bool) -> None: self.mode.setEnabled(not busy); self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.start.setEnabled(not busy and bool(self.single or self.selected))
+        self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.select_works.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
+    def _set_busy(self, busy: bool) -> None: self.mode.setEnabled(not busy); self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
     def _recognize(self) -> None:
         if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return
         self._reset(); self.status.setText("识别中…"); self.step.setText("准备识别"); self.progress.setValue(5); self._log("开始识别链接"); self._run(RecognitionWorker("batch" if self.mode.currentIndex() else "single", self.url.text()))
@@ -138,9 +145,13 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         if isinstance(result, VideoInfo): self.single = result; self.author.setText(result.author); self.summary.setText(result.title); self.detail.setText(result.content[:240] + ("…" if len(result.content) > 240 else "")); self.status.setText("成功"); self.step.setText("识别完成，可以开始任务"); self._log(f"识别成功：{result.author} / {result.title}")
         else:
-            self.profile = result; self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.detail.setText("正在选择要采集的作品"); self.status.setText("成功"); self._log(f"主页识别成功：{result.author}，{len(result.works)} 项"); dialog = WorksSelectionDialog(result, self)
-            if dialog.exec() == QDialog.Accepted: self.selected = dialog.selected(); self.summary.setText(f"识别到 {len(result.works)} 个公开作品，已选择 {len(self.selected)} 项"); self.detail.setText("已选择作品，点击“开始任务”后顺序采集"); self.step.setText("选择完成，可以开始任务"); self.start.setEnabled(True)
-            else: self.step.setText("未选择作品，可重新识别")
+            self.profile = result; self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.detail.setText("请选择要采集的作品"); self.status.setText("成功"); self.select_works.setEnabled(True); self._log(f"主页识别成功：{result.author}，{len(result.works)} 项"); self._choose_works()
+    def _choose_works(self) -> None:
+        if not self.profile: return
+        dialog = WorksSelectionDialog(self.profile, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.selected = dialog.selected(); self.summary.setText(f"识别到 {len(self.profile.works)} 个公开作品，已选择 {len(self.selected)} 项"); self.detail.setText("已选择作品，点击“开始任务”后顺序采集"); self.step.setText("选择完成，可以开始任务"); self.select_works.setText(f"重新选择（已选 {len(self.selected)}）"); self.start.setEnabled(True)
+        else: self.step.setText("可点击“选择作品”重新打开")
     @Slot(int, int, str, str)
     def _batch_progress(self, index: int, total: int, title: str, step: str) -> None: self.progress.setValue(int((index - 1) * 100 / total)); self.step.setText(f"当前 {index}/{total}：{_short(title, 36)} — {step}"); self._log(self.step.text())
     @Slot(object)
@@ -153,7 +164,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _finished(self) -> None: self.thread = None; self.worker = None; self._set_busy(False)
     def _open_folder(self) -> None:
-        if self.output_dir and self.output_dir.exists(): QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir))); self._log("已打开保存文件夹")
+        if self.output_dir and self.output_dir.exists(): QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir)))
 
 
 def _short(value: str, size: int) -> str: return value[:size] + ("…" if len(value) > size else "")

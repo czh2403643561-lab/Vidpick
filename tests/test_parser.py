@@ -1,4 +1,4 @@
-from douyin_parser import normalize_profile_cards, parse_html, parse_profile_page
+from douyin_parser import normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -55,3 +55,19 @@ def test_normalize_profile_cards_ignores_non_work_links() -> None:
         {"url": "//www.douyin.com/video/999", "title": "作品"},
     ])
     assert [work.url for work in works] == ["https://www.douyin.com/video/999"]
+
+
+def test_normalize_douyin_url_extracts_a_link_from_share_text() -> None:
+    value = "复制打开抖音 [https://v.douyin.com/example/](https://v.douyin.com/example/) 查看作品"
+    assert normalize_douyin_url(value) == "https://v.douyin.com/example/"
+
+
+def test_profile_cards_keep_structured_fields() -> None:
+    work = normalize_profile_cards([{
+        "url": "https://www.douyin.com/note/123",
+        "title": "标题",
+        "aweme_id": "123",
+        "author": "博主",
+        "desc": "完整正文",
+    }])[0]
+    assert (work.aweme_id, work.author, work.desc) == ("123", "博主", "完整正文")

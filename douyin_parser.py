@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import html as html_lib
 import json
+from pathlib import Path
 import re
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
@@ -30,6 +31,9 @@ class ProfileWork:
     url: str
     cover_url: str
     title: str
+    aweme_id: str = ""
+    author: str = ""
+    desc: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,12 +44,16 @@ class ProfileInfo:
 
 
 ProgressCallback = Callable[[str], None]
+PROFILE_DIR = Path(__file__).resolve().parent / "browser_profile"
 
 
 def normalize_douyin_url(value: str) -> str:
     """Validate a common Douyin URL and add https when it was omitted."""
 
     value = value.strip()
+    links = re.findall(r"https?://[^\s\]\)]+douyin\.com[^\s\]\)]*", value, re.IGNORECASE)
+    if links:
+        value = links[0]
     if not value:
         raise DouyinParseError("请输入抖音作品链接")
     if not re.match(r"^https?://", value, re.IGNORECASE):
@@ -84,13 +92,15 @@ class DouyinSession:
         self._browser = None
         self._context = None
         self._page = None
+        self._awemes: list[dict[str, Any]] = []
 
     def __enter__(self) -> "DouyinSession":
         try:
             self._report("启动 Chromium")
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=True)
-            self._context = self._browser.new_context(
+            PROFILE_DIR.mkdir(exist_ok=True)
+            self._context = self._playwright.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=True,
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
                 user_agent=(
@@ -100,7 +110,8 @@ class DouyinSession:
                 ),
                 viewport={"width": 1440, "height": 1000},
             )
-            self._page = self._context.new_page()
+            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+            self._page.on("response", self._capture_response)
             return self
         except Exception as exc:
             self.__exit__(None, None, None)
@@ -120,6 +131,7 @@ class DouyinSession:
         page = self._require_page()
         report = progress or self._report
         try:
+            self._awemes.clear()
             report("打开作品链接并等待跳转")
             page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
             self._wait_for_page(page)
@@ -127,6 +139,10 @@ class DouyinSession:
             page_html = page.content()
             body_text = _body_text(page)
             report("解析作者和作品正文")
+            if self._awemes:
+                structured = _video_from_aweme(self._awemes[-1], page.url or normalized_url)
+                if structured.content:
+                    return structured
             return parse_html(page_html, page.url or normalized_url, body_text)
         except DouyinParseError:
             raise
@@ -137,11 +153,18 @@ class DouyinSession:
         normalized_url = normalize_douyin_url(url)
         page = self._require_page()
         try:
+            self._awemes.clear()
             self._report("打开博主主页并等待跳转")
             page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
             self._wait_for_page(page)
             self._report("读取公开作品列表")
-            works = self._scroll_profile_works(page)
+            works = _works_from_awemes(self._awemes)
+            if not works:
+                works = self._scroll_profile_works(page)
+            if not works:
+                self._report("未读取到作品，正在重新加载一次")
+                self._awemes.clear(); page.reload(wait_until="domcontentloaded", timeout=35_000); self._wait_for_page(page)
+                works = _works_from_awemes(self._awemes) or self._scroll_profile_works(page)
             return parse_profile_page(page.url or normalized_url, page.title(), _body_text(page), works)
         except DouyinParseError:
             raise
@@ -180,6 +203,19 @@ class DouyinSession:
             raise DouyinParseError("浏览器会话尚未启动")
         return self._page
 
+    def _capture_response(self, response) -> None:
+        if "/aweme/" not in response.url or "json" not in response.headers.get("content-type", "").lower():
+            return
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                detail = payload.get("aweme_detail")
+                items = payload.get("aweme_list")
+                if isinstance(detail, dict): self._awemes.append(detail)
+                if isinstance(items, list): self._awemes.extend(item for item in items if isinstance(item, dict))
+        except Exception:
+            return
+
 
 def parse_profile_page(
     final_url: str,
@@ -190,10 +226,13 @@ def parse_profile_page(
     """Pure profile parsing: suitable for unit tests and independent of page selectors."""
 
     author = _profile_author(document_title, body_text)
-    works = tuple(normalize_profile_cards(cards))
+    card_list = list(cards)
+    works = tuple(card_list) if all(isinstance(card, ProfileWork) for card in card_list) else tuple(normalize_profile_cards(card_list))
     if not author:
         raise DouyinParseError("未能识别博主名称，页面可能需要登录或结构发生变化")
     if not works:
+        if "/user/self" in final_url:
+            raise DouyinParseError("需要登录：当前链接依赖登录状态")
         raise DouyinParseError("未识别到可访问的公开作品，可能需要登录或页面受限")
     return ProfileInfo(author=author, url=final_url, works=works)
 
@@ -212,8 +251,23 @@ def normalize_profile_cards(cards: Iterable[dict[str, str]]) -> list[ProfileWork
         cover_url = str(card.get("cover_url", "")).strip()
         if not re.match(r"^https?://", cover_url, re.IGNORECASE):
             cover_url = ""
-        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品"))
+        works.append(ProfileWork(url=url, cover_url=cover_url, title=title or "未命名作品", aweme_id=str(card.get("aweme_id", "")), author=str(card.get("author", "")), desc=str(card.get("desc", ""))))
     return works
+
+
+def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
+    cards = []
+    for item in items:
+        aweme_id = str(item.get("aweme_id", "")); desc = _clean_text(item.get("desc", "")); author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
+        video = item.get("video", {}) if isinstance(item.get("video"), dict) else {}; cover = video.get("cover", {}) if isinstance(video.get("cover"), dict) else {}; urls = cover.get("url_list", []) if isinstance(cover.get("url_list"), list) else []
+        if aweme_id: cards.append({"url": f"https://www.douyin.com/{'note' if item.get('images') else 'video'}/{aweme_id}", "cover_url": urls[0] if urls else "", "title": desc, "aweme_id": aweme_id, "author": author, "desc": desc})
+    return normalize_profile_cards(cards)
+
+
+def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
+    author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
+    desc = _clean_text(item.get("desc", ""))
+    return VideoInfo(author=author, title=_first_line(desc, 80) or "未命名作品", content=desc, url=url)
 
 
 def _read_profile_cards(page) -> list[dict[str, str]]:

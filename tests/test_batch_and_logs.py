@@ -60,3 +60,19 @@ def test_batch_worker_passes_progress_and_continues_after_one_failure(monkeypatc
     folder, success, failed, _ = completed[0]
     assert folder == tmp_path / "测试博主"
     assert (success, failed) == (2, 1)
+
+
+def test_batch_worker_saves_profile_desc_without_browser(monkeypatch, tmp_path) -> None:
+    class UnexpectedSession:
+        def __enter__(self):
+            raise AssertionError("已有正文不应启动浏览器")
+
+    monkeypatch.setattr(main, "DouyinSession", UnexpectedSession)
+    worker = main.BatchWorker([ProfileWork("https://www.douyin.com/note/1", "", "标题", "1", "博主", "完整正文")], tmp_path)
+    completed = []
+    worker.succeeded.connect(completed.append)
+    worker.run()
+
+    folder, success, failed, _ = completed[0]
+    assert folder.name == "博主"
+    assert (success, failed) == (1, 0)
