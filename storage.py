@@ -187,13 +187,16 @@ def save_media(
         _clear_managed_media(work_dir)
 
     report = progress or (lambda _message: None)
-    if info.work_type == "image" and info.image_urls:
+    if info.work_type == "image":
+        total = info.image_total or len(info.image_urls)
+        if not info.image_urls:
+            return MediaSaveResult(total=total)
         image_dir = work_dir / "images"
         image_dir.mkdir(exist_ok=True)
         saved = 0
         first_image: Path | None = None
         for index, url in enumerate(info.image_urls, 1):
-            report(f"下载图片 {index}/{len(info.image_urls)}")
+            report(f"下载无水印图片 {index}/{len(info.image_urls)}")
             try:
                 image_path = _download_to_stem(url, image_dir / f"{index:02d}")
             except Exception:
@@ -203,7 +206,7 @@ def save_media(
                 first_image = image_path
         if first_image is not None:
             _copy_as_cover(first_image, work_dir)
-        return MediaSaveResult(total=len(info.image_urls), saved=saved, cover_saved=first_image is not None)
+        return MediaSaveResult(total=total, saved=saved, cover_saved=first_image is not None)
 
     if info.cover_url:
         report("下载作品封面")
@@ -235,7 +238,7 @@ def _copy_as_cover(source: Path, work_dir: Path) -> None:
 
 
 def _download_to_stem(url: str, stem: Path) -> Path:
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"})
     temporary_path: Path | None = None
     try:
         with urlopen(request, timeout=15) as response:

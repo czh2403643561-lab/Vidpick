@@ -164,7 +164,10 @@ class MainWindow(QMainWindow):
         if text:
             self.url.setText(text)
     def _work_type_text(self, info: VideoInfo) -> str:
-        return f"图文 · {len(info.image_urls)} 张" if info.work_type == "image" else "视频"
+        if info.work_type != "image":
+            return "视频"
+        total = info.image_total or len(info.image_urls)
+        return f"图文 · {total} 张" if len(info.image_urls) == total else f"图文 · {len(info.image_urls)}/{total} 张可用"
     def _mode_changed(self, mode: str) -> None:
         if mode == self.current_mode: return
         self.current_mode = mode; self.mode_buttons[mode].setChecked(True); self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if mode == "batch" else "粘贴抖音网页版作品地址"); self.select_works.setVisible(mode == "batch"); self.select_works.setText("选择作品"); self.preview_card.setVisible(mode == "single"); self._show_mode_log(); self._reset()
@@ -244,7 +247,12 @@ class MainWindow(QMainWindow):
         save_result, media = result; self.output_dir, content_path, when = save_result; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True)
         title = self.single.title if self.single else content_path.parent.name
         if self.single and self.single.work_type == "image":
-            message = f"保存成功：{title} · 正文 + {media.saved} 张图片" if media.saved == media.total else f"保存完成：{title} · 正文成功，图片 {media.saved}/{media.total}"
+            if media.total and media.saved == media.total:
+                message = f"保存成功：{title} · 正文 + {media.saved} 张无水印图片"
+            elif media.saved:
+                message = f"保存完成：{title} · 正文成功，无水印图片 {media.saved}/{media.total}"
+            else:
+                message = f"保存完成：{title} · 正文成功，未获取到可靠的无水印图片源"
         elif media.cover_saved:
             message = f"保存成功：{title} · 正文 + 封面"
         elif self.single and self.single.cover_url:

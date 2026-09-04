@@ -35,7 +35,7 @@ def test_save_video_uses_id_work_folder_and_preserves_old_flat_file(tmp_path) ->
     assert list(author_dir.glob("*.txt")) == [old_flat]
 
     record = json.loads((author_dir / "data.jsonl").read_text(encoding="utf-8"))
-    assert {"aweme_id", "author", "title", "url", "content", "work_type", "cover_url", "image_urls", "collected_at"} <= record.keys()
+    assert {"aweme_id", "author", "title", "url", "content", "work_type", "cover_url", "image_urls", "image_total", "collected_at"} <= record.keys()
 
 
 def test_duplicate_save_requires_overwrite_and_upserts_one_record(tmp_path) -> None:
@@ -132,6 +132,18 @@ def test_media_download_failure_keeps_saved_content(monkeypatch, tmp_path) -> No
     assert content_path.read_text(encoding="utf-8") == "正文\n"
     assert (content_path.parent / "images" / "01.jpg").exists()
     assert not (content_path.parent / "images" / "02.jpg").exists()
+
+
+def test_risky_only_image_source_is_reported_as_unavailable(tmp_path) -> None:
+    info = VideoInfo(
+        "测试博主", "作品", "正文", "https://www.douyin.com/note/123", "123",
+        work_type="image", image_total=1,
+    )
+
+    result = save_media(info, tmp_path / "作品__123")
+
+    assert (result.total, result.saved, result.cover_saved) == (1, 0, False)
+    assert not (tmp_path / "作品__123" / "images").exists()
 
 
 def test_save_video_media_only_downloads_cover(monkeypatch, tmp_path) -> None:

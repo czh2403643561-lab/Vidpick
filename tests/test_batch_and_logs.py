@@ -152,6 +152,24 @@ def test_single_mode_shows_media_type_and_preview_card_but_batch_hides_it() -> N
     window.close()
 
 
+def test_single_preview_uses_the_same_clean_cover_url_as_image_data(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    preview_urls: list[str] = []
+    monkeypatch.setattr(window, "_load_preview", preview_urls.append)
+    info = VideoInfo(
+        "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", cover_url="https://clean.example/01.webp",
+        image_urls=("https://clean.example/01.webp", "https://clean.example/02.webp"), image_total=2,
+    )
+
+    window._recognized(info)
+
+    assert info.cover_url == info.image_urls[0]
+    assert preview_urls == ["https://clean.example/01.webp"]
+    window.close()
+
+
 def test_single_save_log_reports_partial_image_download() -> None:
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
@@ -162,7 +180,21 @@ def test_single_save_log_reports_partial_image_download() -> None:
 
     window._saved(((Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1" / "content.txt", "2026-09-04"), MediaSaveResult(total=2, saved=1, cover_saved=True)))
 
-    assert "保存完成：图文作品 · 正文成功，图片 1/2" in window.logs.toPlainText()
+    assert "保存完成：图文作品 · 正文成功，无水印图片 1/2" in window.logs.toPlainText()
+    window.close()
+
+
+def test_single_save_log_marks_risky_only_image_source_as_unavailable() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    window.single = VideoInfo(
+        "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", image_total=1,
+    )
+
+    window._saved(((Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1" / "content.txt", "2026-09-04"), MediaSaveResult(total=1, saved=0)))
+
+    assert "保存完成：图文作品 · 正文成功，未获取到可靠的无水印图片源" in window.logs.toPlainText()
     window.close()
 
 

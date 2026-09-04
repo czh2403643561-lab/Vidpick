@@ -124,22 +124,47 @@ def test_target_html_returns_the_verified_aweme_id() -> None:
     assert parse_target_html(html, "https://www.douyin.com/video/123", "123").aweme_id == "123"
 
 
-def test_target_aweme_media_prefers_original_image_urls_and_keeps_order() -> None:
+def test_target_aweme_media_prefers_clean_image_urls_and_keeps_order() -> None:
     info = _video_from_aweme({
         "aweme_id": "123",
         "desc": "图文作品",
         "author": {"nickname": "测试博主"},
         "images": [
-            {"download_url_list": ["https://image/original-1.webp"], "url_list": ["https://image/thumb-1.webp"]},
-            {"download_url_list": ["https://image/original-1.webp"], "url_list": ["https://image/thumb-duplicate.webp"]},
-            {"url_list": ["https://image/display-2.webp"]},
+            {"url_list": ["https://clean.example/a.webp"], "download_url_list": ["https://watermark.example/a.webp"]},
+            {"url_list": ["https://clean.example/a.webp"], "download_url_list": ["https://watermark.example/a-copy.webp"]},
+            {"url_list": ["https://clean.example/b.webp"]},
         ],
     }, "https://www.douyin.com/note/123")
 
     assert info.aweme_id == "123"
     assert info.work_type == "image"
-    assert info.cover_url == "https://image/original-1.webp"
-    assert info.image_urls == ("https://image/original-1.webp", "https://image/display-2.webp")
+    assert info.image_total == 2
+    assert info.cover_url == "https://clean.example/a.webp"
+    assert info.image_urls == ("https://clean.example/a.webp", "https://clean.example/b.webp")
+
+
+def test_target_aweme_media_uses_clean_url_list_when_it_is_the_only_source() -> None:
+    info = _video_from_aweme({
+        "aweme_id": "124",
+        "desc": "图文作品",
+        "author": {"nickname": "测试博主"},
+        "images": [{"url_list": ["https://clean.example/only.webp"]}],
+    }, "https://www.douyin.com/note/124")
+
+    assert (info.work_type, info.image_total, info.cover_url, info.image_urls) == (
+        "image", 1, "https://clean.example/only.webp", ("https://clean.example/only.webp",),
+    )
+
+
+def test_target_aweme_media_does_not_treat_watermarked_download_as_clean() -> None:
+    info = _video_from_aweme({
+        "aweme_id": "125",
+        "desc": "图文作品",
+        "author": {"nickname": "测试博主"},
+        "images": [{"download_url_list": ["https://watermark.example/only.webp"]}],
+    }, "https://www.douyin.com/note/125")
+
+    assert (info.work_type, info.image_total, info.cover_url, info.image_urls) == ("image", 1, "", ())
 
 
 def test_target_aweme_video_uses_its_own_cover_without_images() -> None:
@@ -150,7 +175,7 @@ def test_target_aweme_video_uses_its_own_cover_without_images() -> None:
         "video": {"origin_cover": {"url_list": ["https://cover/original.jpg"]}},
     }, "https://www.douyin.com/video/456")
 
-    assert (info.work_type, info.cover_url, info.image_urls) == ("video", "https://cover/original.jpg", ())
+    assert (info.work_type, info.cover_url, info.image_urls, info.image_total) == ("video", "https://cover/original.jpg", (), 0)
 
 
 def test_target_html_fails_closed_when_only_other_work_exists() -> None:

@@ -28,6 +28,7 @@ class VideoInfo:
     work_type: str = "video"
     cover_url: str = ""
     image_urls: tuple[str, ...] = ()
+    image_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -378,7 +379,7 @@ def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
 def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
     author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
     desc = _clean_text(item.get("desc", ""))
-    work_type, cover_url, image_urls = _media_from_aweme(item)
+    work_type, cover_url, image_urls, image_total = _media_from_aweme(item)
     return VideoInfo(
         author=author,
         title=_first_line(desc, 80) or "未命名作品",
@@ -388,25 +389,35 @@ def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
         work_type=work_type,
         cover_url=cover_url,
         image_urls=image_urls,
+        image_total=image_total,
     )
 
 
-def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...], int]:
     """Read media only from the already verified target aweme object."""
 
     images = item.get("images")
     if isinstance(images, list):
         image_urls: list[str] = []
-        seen: set[str] = set()
+        seen_images: set[str] = set()
+        image_total = 0
         for image in images:
             if not isinstance(image, dict):
                 continue
-            media_url = _best_image_url(image)
-            if media_url and media_url not in seen:
-                seen.add(media_url)
-                image_urls.append(media_url)
-        if image_urls:
-            return "image", image_urls[0], tuple(image_urls)
+            clean_urls = _clean_image_urls(image)
+            risk_urls = _watermarked_image_urls(image)
+            identity = (clean_urls or risk_urls)[0] if clean_urls or risk_urls else ""
+            if not identity or identity in seen_images:
+                continue
+            seen_images.add(identity)
+            image_total += 1
+            if clean_urls:
+                image_urls.append(clean_urls[0])
+
+        if image_total:
+            # download_url_list is intentionally excluded: real Douyin data marks it
+            # with tplv-dy-water-v2 and it contains the account watermark.
+            return "image", image_urls[0] if image_urls else "", tuple(image_urls), image_total
 
     video = item.get("video")
     cover_url = ""
@@ -415,19 +426,26 @@ def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
             cover_url = _first_url(video.get(key))
             if cover_url:
                 break
-    return "video", cover_url, ()
+    return "video", cover_url, (), 0
 
 
-def _best_image_url(image: dict[str, Any]) -> str:
-    """Prefer Douyin's original/download URLs over display thumbnail URLs."""
+def _clean_image_urls(image: dict[str, Any]) -> tuple[str, ...]:
+    """Return the tested clean static-image candidates from an aweme image item."""
 
-    for key in ("download_url_list", "url_list"):
-        urls = image.get(key)
-        if isinstance(urls, list):
-            for value in urls:
-                if isinstance(value, str) and value.startswith(("https://", "http://")):
-                    return value
-    return ""
+    return _image_urls_from_field(image, "url_list")
+
+
+def _watermarked_image_urls(image: dict[str, Any]) -> tuple[str, ...]:
+    """Return risky download candidates; they are never silently saved as clean media."""
+
+    return _image_urls_from_field(image, "download_url_list")
+
+
+def _image_urls_from_field(image: dict[str, Any], key: str) -> tuple[str, ...]:
+    urls = image.get(key)
+    if not isinstance(urls, list):
+        return ()
+    return tuple(value for value in urls if isinstance(value, str) and value.startswith(("https://", "http://")))
 
 
 def _first_url(value: Any) -> str:
