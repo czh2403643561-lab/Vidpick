@@ -382,6 +382,18 @@ def test_batch_recognition_shows_star_and_refreshes_favorite_data(tmp_path, monk
     favorites_path = tmp_path / "favorites.json"
     monkeypatch.setattr(main, "FAVORITES_PATH", favorites_path)
     monkeypatch.setattr(main.MainWindow, "_choose_works", lambda _window: None)
+    category = main.create_favorite_category("AI绘画", favorites_path)
+    class FakeCategorySelectionDialog:
+        selected_category_id = category["id"]
+        new_category_names = {}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(main, "CategorySelectionDialog", FakeCategorySelectionDialog)
     window = main.MainWindow()
     profile = main.ProfileInfo(
         "测试博主", "https://www.douyin.com/user/test?vid=123",
@@ -397,6 +409,7 @@ def test_batch_recognition_shows_star_and_refreshes_favorite_data(tmp_path, monk
     assert not window.favorite_button.icon().isNull()
     assert window.favorite_button.property("favorite") is True
     assert main.load_favorite_bloggers(favorites_path)[0]["author"] == "测试博主"
+    assert main.load_favorite_bloggers(favorites_path)[0]["category_id"] == category["id"]
 
     window._recognized(profile)
     assert window.favorite_button.property("favorite") is True
@@ -449,6 +462,39 @@ def test_favorites_entry_views_profile_in_batch_mode(monkeypatch) -> None:
     assert window.url.text() == "https://www.douyin.com/user/test"
     assert window.mode_buttons["batch"].isChecked()
     window.close()
+
+
+def test_favorites_dialog_groups_bloggers_by_category_and_collapses_sections(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    favorites_path = tmp_path / "favorites.json"
+    monkeypatch.setattr(main, "FAVORITES_PATH", favorites_path)
+    category = main.create_favorite_category("AI绘画", favorites_path)
+    main.upsert_favorite_blogger("测试博主", "https://www.douyin.com/user/test", ["1"], path=favorites_path, category_id=category["id"])
+    dialog = main.FavoritesDialog()
+
+    assert dialog.heading.text() == "收藏库 · 1 位博主"
+    assert set(dialog.category_sections) == {main.DEFAULT_CATEGORY_ID, category["id"]}
+    assert dialog.category_sections[main.DEFAULT_CATEGORY_ID][0].text().startswith("▼ ")
+    assert dialog.category_sections[category["id"]][0].text().startswith("▶ ")
+    assert "测试博主" in " ".join(label.text() for label in dialog.findChildren(main.QLabel))
+
+    dialog._toggle_category(category["id"])
+    assert dialog.category_sections[category["id"]][0].text().startswith("▼ ")
+    dialog.close()
+
+
+def test_category_selection_dialog_defaults_to_first_category() -> None:
+    app = QApplication.instance() or QApplication([])
+    dialog = main.CategorySelectionDialog([
+        {"id": main.DEFAULT_CATEGORY_ID, "name": "默认分类"},
+        {"id": "ai", "name": "AI绘画"},
+    ])
+
+    assert dialog.selected_category_id == main.DEFAULT_CATEGORY_ID
+    dialog.category_group.buttons()[1].setChecked(True)
+    assert dialog.selected_category_id == "ai"
+    assert dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
+    dialog.close()
 
 
 @pytest.mark.parametrize("choice, expected_ids, overwrite, skipped", [

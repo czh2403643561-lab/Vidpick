@@ -4,7 +4,7 @@ import pytest
 
 from douyin_parser import VideoInfo
 import storage
-from storage import AlreadyCollectedError, AssetState, CollectionOptions, get_asset_state, get_author_dir, get_work_dir, is_collected, is_favorite_blogger, load_favorite_bloggers, remove_favorite_blogger, save_media, save_selected_assets, save_video, safe_filename, upsert_favorite_blogger
+from storage import AlreadyCollectedError, AssetState, CollectionOptions, DEFAULT_CATEGORY_ID, create_favorite_category, delete_favorite_category, get_asset_state, get_author_dir, get_work_dir, is_collected, is_favorite_blogger, load_favorite_bloggers, load_favorite_library, remove_favorite_blogger, rename_favorite_category, save_media, save_selected_assets, save_video, safe_filename, upsert_favorite_blogger
 
 
 def test_safe_filename_handles_windows_names() -> None:
@@ -376,3 +376,35 @@ def test_favorite_bloggers_persist_refresh_and_remove(tmp_path) -> None:
     assert remove_favorite_blogger("https://www.douyin.com/user/test?vid=1", path)
     assert load_favorite_bloggers(path) == []
     assert not remove_favorite_blogger("https://www.douyin.com/user/test", path)
+
+
+def test_favorite_categories_assign_and_delete_without_losing_bloggers(tmp_path) -> None:
+    path = tmp_path / "favorites.json"
+    category = create_favorite_category("AI绘画", path)
+    upsert_favorite_blogger("测试博主", "https://www.douyin.com/user/test", ["1"], "2026-09-04T18:00:00+08:00", path, category["id"])
+
+    library = load_favorite_library(path)
+    assert {item["name"] for item in library["categories"]} == {"默认分类", "AI绘画"}
+    assert library["bloggers"][0]["category_id"] == category["id"]
+    assert rename_favorite_category(category["id"], "灵感收藏", path)
+    assert load_favorite_library(path)["categories"][1]["name"] == "灵感收藏"
+
+    assert delete_favorite_category(category["id"], path)
+    library = load_favorite_library(path)
+    assert library["bloggers"][0]["author"] == "测试博主"
+    assert library["bloggers"][0]["category_id"] == DEFAULT_CATEGORY_ID
+
+
+def test_legacy_favorite_list_is_loaded_into_default_category(tmp_path) -> None:
+    path = tmp_path / "favorites.json"
+    path.write_text(json.dumps([{
+        "author": "旧博主",
+        "profile_url": "https://www.douyin.com/user/old?vid=123",
+        "last_checked_at": "2026-09-04T18:00:00+08:00",
+        "last_seen_aweme_ids": ["1"],
+    }], ensure_ascii=False), encoding="utf-8")
+
+    library = load_favorite_library(path)
+    assert library["categories"] == [{"id": DEFAULT_CATEGORY_ID, "name": "默认分类"}]
+    assert library["bloggers"][0]["author"] == "旧博主"
+    assert library["bloggers"][0]["category_id"] == DEFAULT_CATEGORY_ID

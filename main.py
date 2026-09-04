@@ -10,10 +10,10 @@ import time
 from PySide6.QtCore import QObject, QSettings, QThread, QSize, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
-from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QButtonGroup, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QButtonGroup, QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget, QInputDialog
 
 from douyin_parser import DouyinSession, ProfileInfo, ProfileWork, VideoInfo, extract_profile, extract_video
-from storage import FAVORITES_PATH, AssetState, CollectionOptions, SelectedSaveResult, get_asset_state, is_favorite_blogger, load_favorite_bloggers, remove_favorite_blogger, save_selected_assets, upsert_favorite_blogger
+from storage import DEFAULT_CATEGORY_ID, FAVORITES_PATH, AssetState, CollectionOptions, SelectedSaveResult, create_favorite_category, delete_favorite_category, get_asset_state, get_favorite_categories, is_favorite_blogger, load_favorite_bloggers, load_favorite_library, remove_favorite_blogger, rename_favorite_category, save_selected_assets, upsert_favorite_blogger
 
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "vidpick-icon.ico"
@@ -142,22 +142,67 @@ class WorksSelectionDialog(QDialog):
     def selected(self) -> list[ProfileWork]: return [work for work, check in zip(self.profile.works, self.checks) if check.isChecked()]
 
 
+class CategorySelectionDialog(QDialog):
+    def __init__(self, categories: list[dict], parent=None) -> None:
+        super().__init__(parent); self.categories = [dict(category) for category in categories]; self.new_category_names: dict[str, str] = {}; self.selected_category_id = ""; self.setWindowTitle("收藏到"); self.setMinimumWidth(300); self._build()
+    def _build(self) -> None:
+        root = QVBoxLayout(self); root.setContentsMargins(16, 14, 16, 16); root.setSpacing(8); root.addWidget(QLabel("收藏到：")); self.category_group = QButtonGroup(self); self.category_layout = QVBoxLayout(); root.addLayout(self.category_layout)
+        for category in self.categories: self._add_category(category)
+        new_button = QPushButton("新建分类"); new_button.clicked.connect(self._new_category); root.addWidget(new_button)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok); self.buttons.button(QDialogButtonBox.Ok).setText("确认收藏"); self.buttons.accepted.connect(self._accept); self.buttons.rejected.connect(self.reject); root.addWidget(self.buttons); self._update_accept()
+    def _add_category(self, category: dict) -> None:
+        radio = QRadioButton(category["name"]); radio.setProperty("category_id", category["id"]); radio.toggled.connect(self._update_accept); self.category_group.addButton(radio); self.category_layout.addWidget(radio)
+        if not self.selected_category_id: radio.setChecked(True); self.selected_category_id = category["id"]
+    def _new_category(self) -> None:
+        name, accepted = QInputDialog.getText(self, "新建分类", "分类名称：")
+        name = name.strip()
+        if not accepted or not name: return
+        existing = next((category for category in self.categories if category["name"] == name), None)
+        if existing is not None:
+            self._select(existing["id"]); return
+        category_id = f"new-{len(self.new_category_names) + 1}"; self.new_category_names[category_id] = name; category = {"id": category_id, "name": name}; self.categories.append(category); self._add_category(category); self._select(category_id)
+    def _select(self, category_id: str) -> None:
+        for button in self.category_group.buttons():
+            if button.property("category_id") == category_id: button.setChecked(True); self.selected_category_id = category_id; return
+    def _update_accept(self, *_args) -> None:
+        button = self.category_group.checkedButton(); self.selected_category_id = str(button.property("category_id")) if button else "";
+        if hasattr(self, "buttons"): self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(self.selected_category_id))
+    def _accept(self) -> None:
+        self._update_accept(); self.accept() if self.selected_category_id else None
+
+
 class FavoritesDialog(QDialog):
     def __init__(self, parent=None) -> None:
-        super().__init__(parent); self.view_profile_url = ""; self.setWindowTitle("收藏博主"); self.resize(520, 420); self._build()
+        super().__init__(parent); self.view_profile_url = ""; self.expanded_categories: set[str] = set(); self.category_sections: dict[str, tuple[QPushButton, QWidget]] = {}; self.setWindowTitle("收藏博主"); self.resize(560, 520); self._build()
     def _build(self) -> None:
-        root = QVBoxLayout(self); root.setContentsMargins(16, 14, 16, 16); root.setSpacing(10); self.heading = QLabel(); root.addWidget(self.heading)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QScrollArea.NoFrame); content = QWidget(); self.list_layout = QVBoxLayout(content); self.list_layout.setContentsMargins(0, 0, 0, 0); self.list_layout.setSpacing(8); scroll.setWidget(content); root.addWidget(scroll, 1); self._refresh()
+        root = QVBoxLayout(self); root.setContentsMargins(16, 14, 16, 16); root.setSpacing(10); self.heading = QLabel(); top = QHBoxLayout(); top.addWidget(self.heading); top.addStretch(); new_button = QPushButton("新建分类"); new_button.clicked.connect(self._new_category); top.addWidget(new_button); root.addLayout(top)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QScrollArea.NoFrame); content = QWidget(); self.list_layout = QVBoxLayout(content); self.list_layout.setContentsMargins(0, 0, 0, 0); self.list_layout.setSpacing(6); scroll.setWidget(content); root.addWidget(scroll, 1); self._refresh()
     def _refresh(self) -> None:
         while self.list_layout.count():
             item = self.list_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        favorites = load_favorite_bloggers(FAVORITES_PATH); self.heading.setText(f"已收藏 {len(favorites)} 位博主")
-        if not favorites:
-            empty = QLabel("还没有收藏博主"); empty.setObjectName("favorite_empty"); self.list_layout.addWidget(empty)
-        for favorite in favorites:
-            card = QGroupBox(); card.setObjectName("favorite_card"); row = QHBoxLayout(card); row.setContentsMargins(12, 10, 12, 10); info = QVBoxLayout(); author = QLabel(favorite["author"]); author.setObjectName("favorite_author"); count = len(favorite.get("last_seen_aweme_ids", [])); info.addWidget(author); info.addWidget(QLabel(f"上次识别：{_display_favorite_time(favorite.get('last_checked_at', ''))}")); info.addWidget(QLabel(f"作品数量：{count}")); row.addLayout(info, 1); view = QPushButton("查看"); view.clicked.connect(lambda _checked=False, url=favorite["profile_url"]: self._view(url)); remove = QPushButton("取消收藏"); remove.clicked.connect(lambda _checked=False, url=favorite["profile_url"]: self._remove(url)); row.addWidget(view); row.addWidget(remove); self.list_layout.addWidget(card)
+        self.category_sections = {}; library = load_favorite_library(FAVORITES_PATH); categories = library["categories"]; favorites = library["bloggers"]; self.heading.setText(f"收藏库 · {len(favorites)} 位博主")
+        if categories and not self.expanded_categories: self.expanded_categories.add(categories[0]["id"])
+        for category in categories:
+            category_id = category["id"]; expanded = category_id in self.expanded_categories; header_row = QHBoxLayout(); toggle = QPushButton(("▼ " if expanded else "▶ ") + category["name"]); toggle.setObjectName("favorite_category_header"); toggle.clicked.connect(lambda _checked=False, cid=category_id: self._toggle_category(cid)); header_row.addWidget(toggle, 1); rename = QPushButton("重命名"); rename.clicked.connect(lambda _checked=False, cid=category_id, name=category["name"]: self._rename_category(cid, name)); delete = QPushButton("删除"); delete.clicked.connect(lambda _checked=False, cid=category_id: self._delete_category(cid)); rename.setEnabled(category_id != DEFAULT_CATEGORY_ID); delete.setEnabled(category_id != DEFAULT_CATEGORY_ID); header_row.addWidget(rename); header_row.addWidget(delete); header_widget = QWidget(); header_widget.setLayout(header_row); self.list_layout.addWidget(header_widget); body = QWidget(); body_layout = QVBoxLayout(body); body_layout.setContentsMargins(12, 0, 0, 4); body_layout.setSpacing(6); category_favorites = [favorite for favorite in favorites if favorite.get("category_id") == category_id]
+            if not category_favorites: body_layout.addWidget(QLabel("暂无收藏"))
+            for favorite in category_favorites: self._add_favorite_card(body_layout, favorite)
+            body.setVisible(expanded); self.category_sections[category_id] = (toggle, body); self.list_layout.addWidget(body)
         self.list_layout.addStretch()
+    def _add_favorite_card(self, layout: QVBoxLayout, favorite: dict) -> None:
+        card = QGroupBox(); card.setObjectName("favorite_card"); row = QHBoxLayout(card); row.setContentsMargins(12, 8, 12, 8); info = QVBoxLayout(); author = QLabel(favorite["author"]); author.setObjectName("favorite_author"); count = len(favorite.get("last_seen_aweme_ids", [])); info.addWidget(author); info.addWidget(QLabel(f"上次识别：{_display_favorite_time(favorite.get('last_checked_at', ''))}")); info.addWidget(QLabel(f"作品数量：{count}")); row.addLayout(info, 1); view = QPushButton("查看"); view.clicked.connect(lambda _checked=False, url=favorite["profile_url"]: self._view(url)); remove = QPushButton("取消收藏"); remove.clicked.connect(lambda _checked=False, url=favorite["profile_url"]: self._remove(url)); row.addWidget(view); row.addWidget(remove); layout.addWidget(card)
+    def _toggle_category(self, category_id: str) -> None:
+        if category_id in self.expanded_categories: self.expanded_categories.remove(category_id)
+        else: self.expanded_categories.add(category_id)
+        toggle, body = self.category_sections[category_id]; expanded = category_id in self.expanded_categories; body.setVisible(expanded); toggle.setText(("▼ " if expanded else "▶ ") + toggle.text()[2:])
+    def _new_category(self) -> None:
+        name, accepted = QInputDialog.getText(self, "新建分类", "分类名称：")
+        if accepted and name.strip(): create_favorite_category(name, FAVORITES_PATH); self._refresh()
+    def _rename_category(self, category_id: str, old_name: str) -> None:
+        name, accepted = QInputDialog.getText(self, "重命名分类", "分类名称：", text=old_name)
+        if accepted and name.strip(): rename_favorite_category(category_id, name, FAVORITES_PATH); self._refresh()
+    def _delete_category(self, category_id: str) -> None:
+        delete_favorite_category(category_id, FAVORITES_PATH); self.expanded_categories.discard(category_id); self._refresh()
     def _view(self, profile_url: str) -> None:
         self.view_profile_url = profile_url; self.accept()
     def _remove(self, profile_url: str) -> None:
@@ -190,7 +235,7 @@ class MainWindow(QMainWindow):
         self.task_card = QGroupBox(); self.task_card.setObjectName("task_card"); task_layout = QVBoxLayout(self.task_card); task_layout.setContentsMargins(12, 6, 12, 10); task_layout.setSpacing(8); task_layout.addWidget(_card_title("任务")); top = QHBoxLayout(); top.setContentsMargins(0, 0, 0, 0); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.select_works = QPushButton("选择作品"); self.select_works.setEnabled(False); self.select_works.setVisible(False); self.select_works.clicked.connect(self._choose_works); top.addWidget(self.select_works); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(self.task_card)
         self.log_card = QGroupBox(); self.log_card.setObjectName("log_card"); log_layout = QVBoxLayout(self.log_card); log_layout.setContentsMargins(12, 6, 12, 10); log_layout.setSpacing(8); log_layout.addWidget(_card_title("状态 / 日志")); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(self.log_card, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
     def _style(self) -> None:
-        self.setStyleSheet("QMainWindow{background:#f5f6f8;color:#1d1d1f} QWidget#central_widget{background:#f5f6f8} QLabel{background:transparent} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox#link_card,QGroupBox#result_card,QGroupBox#preview_card,QGroupBox#task_card,QGroupBox#log_card{margin-top:0;padding-top:0} QGroupBox::title{subcontrol-origin:margin;left:12px;top:1px;padding:0 4px;background:transparent} QLabel#title{font-size:28px;font-weight:700} QLabel#card_title{color:#111827;font-size:16px;font-weight:700} QLabel#favorite_author{font-weight:600} QLabel#favorite_empty{color:#8992a3;padding:20px} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton:hover{background:#e2e7ef} QPushButton:pressed{background:#d5dce8} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary{background:#2775e8;color:white} QPushButton#primary:hover{background:#3c86ef;color:white} QPushButton#primary:pressed{background:#1f62c7;color:white} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QPushButton#utility{padding:0;min-width:38px;max-width:38px;min-height:38px;max-height:38px} QPushButton#utility:hover{background:#e1e8f3} QPushButton#utility:pressed{background:#cbd6e7} QPushButton#favorites_entry{padding:0} QPushButton#favorites_entry:hover{background:#e1e8f3} QPushButton#favorite_button{background:transparent;border-radius:15px;padding:0} QPushButton#favorite_button:hover{background:#fff7d6} QPushButton#favorite_button:pressed{background:#ffefb0} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:7px 12px;min-height:16px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:pressed{background:#cbd8ee;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:checked:pressed{background:#294eaa;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QWidget#collection_status{background:#eef2f8;border-radius:10px} QLabel#collection_status_label{color:#667085;font-size:11px} QLabel#collection_status_value{color:#355fc1;font-size:11px;font-weight:600} QLabel#result_label{color:#344054;font-weight:500} QLabel#result_value{font-weight:400} QLabel#preview_image{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px;color:#8992a3;padding:6px} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
+        self.setStyleSheet("QMainWindow{background:#f5f6f8;color:#1d1d1f} QWidget#central_widget{background:#f5f6f8} QLabel{background:transparent} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox#link_card,QGroupBox#result_card,QGroupBox#preview_card,QGroupBox#task_card,QGroupBox#log_card{margin-top:0;padding-top:0} QGroupBox::title{subcontrol-origin:margin;left:12px;top:1px;padding:0 4px;background:transparent} QLabel#title{font-size:28px;font-weight:700} QLabel#card_title{color:#111827;font-size:16px;font-weight:700} QLabel#favorite_author{font-weight:600} QLabel#favorite_empty{color:#8992a3;padding:20px} QPushButton#favorite_category_header{background:transparent;text-align:left;padding:6px 8px;color:#344054} QPushButton#favorite_category_header:hover{background:#e9eef7} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton:hover{background:#e2e7ef} QPushButton:pressed{background:#d5dce8} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary{background:#2775e8;color:white} QPushButton#primary:hover{background:#3c86ef;color:white} QPushButton#primary:pressed{background:#1f62c7;color:white} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QPushButton#utility{padding:0;min-width:38px;max-width:38px;min-height:38px;max-height:38px} QPushButton#utility:hover{background:#e1e8f3} QPushButton#utility:pressed{background:#cbd6e7} QPushButton#favorites_entry{padding:0} QPushButton#favorites_entry:hover{background:#e1e8f3} QPushButton#favorite_button{background:transparent;border-radius:15px;padding:0} QPushButton#favorite_button:hover{background:#fff7d6} QPushButton#favorite_button:pressed{background:#ffefb0} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:7px 12px;min-height:16px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:pressed{background:#cbd8ee;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:checked:pressed{background:#294eaa;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QWidget#collection_status{background:#eef2f8;border-radius:10px} QLabel#collection_status_label{color:#667085;font-size:11px} QLabel#collection_status_value{color:#355fc1;font-size:11px;font-weight:600} QLabel#result_label{color:#344054;font-weight:500} QLabel#result_value{font-weight:400} QLabel#preview_image{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px;color:#8992a3;padding:6px} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
     def _mode_key(self) -> str: return self.current_mode
     def _log(self, text: str) -> None:
         line = f"[{datetime.now():%H:%M:%S}] {text}"; self.mode_logs.append(self._mode_key(), line); self.logs.appendPlainText(line); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
@@ -326,7 +371,11 @@ class MainWindow(QMainWindow):
         if is_favorite_blogger(self.profile.url, FAVORITES_PATH):
             remove_favorite_blogger(self.profile.url, FAVORITES_PATH); self._set_favorite_button(False); self._log(f"已取消收藏：{self.profile.author}")
         else:
-            upsert_favorite_blogger(self.profile.author, self.profile.url, [work.aweme_id for work in self.profile.works], path=FAVORITES_PATH); self._set_favorite_button(True); self._log(f"已收藏博主：{self.profile.author}")
+            dialog = CategorySelectionDialog(get_favorite_categories(FAVORITES_PATH), self)
+            if dialog.exec() != QDialog.Accepted: return
+            category_id = dialog.selected_category_id
+            if category_id in dialog.new_category_names: category_id = create_favorite_category(dialog.new_category_names[category_id], FAVORITES_PATH)["id"]
+            upsert_favorite_blogger(self.profile.author, self.profile.url, [work.aweme_id for work in self.profile.works], path=FAVORITES_PATH, category_id=category_id); self._set_favorite_button(True); self._log(f"已收藏博主：{self.profile.author}")
     def _show_favorites(self) -> None:
         dialog = FavoritesDialog(self)
         if dialog.exec() == QDialog.Accepted and dialog.view_profile_url:

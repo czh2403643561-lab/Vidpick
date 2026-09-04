@@ -10,6 +10,7 @@ import re
 import shutil
 import tempfile
 from typing import Any, Callable
+import uuid
 from urllib.parse import urlparse, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -25,6 +26,8 @@ class AlreadyCollectedError(StorageError):
 
 
 FAVORITES_PATH = Path(__file__).resolve().parent / "favorites.json"
+DEFAULT_CATEGORY_ID = "default"
+DEFAULT_CATEGORY_NAME = "默认分类"
 
 
 @dataclass(frozen=True)
@@ -161,20 +164,32 @@ def _favorite_profile_url(url: str) -> str:
     return value
 
 
-def load_favorite_bloggers(path: str | Path | None = None) -> list[dict[str, Any]]:
-    """Load the small local favorite-blogger list, tolerating a missing or invalid file."""
-
-    favorite_path = _favorite_path(path)
-    if not favorite_path.is_file():
-        return []
-    try:
-        value = json.loads(favorite_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return []
-    if not isinstance(value, list):
-        return []
-    favorites: list[dict[str, Any]] = []
-    for item in value:
+def _normalize_favorite_library(value: Any) -> dict[str, list[dict[str, Any]]]:
+    if isinstance(value, list):
+        categories: list[dict[str, Any]] = [{"id": DEFAULT_CATEGORY_ID, "name": DEFAULT_CATEGORY_NAME}]
+        bloggers_value = value
+    elif isinstance(value, dict):
+        categories = []
+        for item in value.get("categories", []):
+            if not isinstance(item, dict):
+                continue
+            category_id = str(item.get("id", "")).strip()
+            name = str(item.get("name", "")).strip()
+            if category_id and name and not any(category["id"] == category_id for category in categories):
+                categories.append({"id": category_id, "name": name})
+        bloggers_value = value.get("bloggers", value.get("favorites", []))
+    else:
+        categories = []
+        bloggers_value = []
+    if not any(category["id"] == DEFAULT_CATEGORY_ID for category in categories):
+        categories.insert(0, {"id": DEFAULT_CATEGORY_ID, "name": DEFAULT_CATEGORY_NAME})
+    else:
+        categories.sort(key=lambda category: category["id"] != DEFAULT_CATEGORY_ID)
+    category_ids = {category["id"] for category in categories}
+    bloggers: list[dict[str, Any]] = []
+    if not isinstance(bloggers_value, list):
+        bloggers_value = []
+    for item in bloggers_value:
         if not isinstance(item, dict):
             continue
         author = str(item.get("author", "")).strip()
@@ -184,21 +199,91 @@ def load_favorite_bloggers(path: str | Path | None = None) -> list[dict[str, Any
         ids = item.get("last_seen_aweme_ids", [])
         if not isinstance(ids, list):
             ids = []
-        favorites.append({
+        category_id = str(item.get("category_id", DEFAULT_CATEGORY_ID)).strip()
+        bloggers.append({
             "author": author,
             "profile_url": profile_url,
             "last_checked_at": str(item.get("last_checked_at", "")).strip(),
             "last_seen_aweme_ids": list(dict.fromkeys(str(value).strip() for value in ids if str(value).strip())),
+            "category_id": category_id if category_id in category_ids else DEFAULT_CATEGORY_ID,
         })
-    return favorites
+    return {"categories": categories, "bloggers": bloggers}
 
 
-def save_favorite_bloggers(favorites: list[dict[str, Any]], path: str | Path | None = None) -> None:
-    """Persist favorite bloggers as a readable JSON array beside the application."""
+def load_favorite_library(path: str | Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Load categories and favorite bloggers, including legacy list-formatted data."""
+
+    favorite_path = _favorite_path(path)
+    if not favorite_path.is_file():
+        return _normalize_favorite_library([])
+    try:
+        value = json.loads(favorite_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return _normalize_favorite_library([])
+    return _normalize_favorite_library(value)
+
+
+def load_favorite_bloggers(path: str | Path | None = None) -> list[dict[str, Any]]:
+    """Load only the blogger portion for callers that do not need category metadata."""
+
+    return load_favorite_library(path)["bloggers"]
+
+
+def save_favorite_library(library: dict[str, list[dict[str, Any]]], path: str | Path | None = None) -> None:
+    """Persist the category-aware favorite library as readable JSON."""
 
     favorite_path = _favorite_path(path)
     favorite_path.parent.mkdir(parents=True, exist_ok=True)
-    favorite_path.write_text(json.dumps(favorites, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    favorite_path.write_text(json.dumps(_normalize_favorite_library(library), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def save_favorite_bloggers(favorites: list[dict[str, Any]], path: str | Path | None = None) -> None:
+    """Persist bloggers while preserving any existing category definitions."""
+
+    library = load_favorite_library(path); library["bloggers"] = favorites; save_favorite_library(library, path)
+
+
+def get_favorite_categories(path: str | Path | None = None) -> list[dict[str, Any]]:
+    return load_favorite_library(path)["categories"]
+
+
+def create_favorite_category(name: str, path: str | Path | None = None) -> dict[str, Any]:
+    clean_name = str(name).strip()
+    if not clean_name:
+        raise StorageError("分类名称不能为空")
+    library = load_favorite_library(path)
+    existing = next((category for category in library["categories"] if category["name"] == clean_name), None)
+    if existing is not None:
+        return existing
+    category = {"id": f"category-{uuid.uuid4().hex[:10]}", "name": clean_name}
+    library["categories"].append(category); save_favorite_library(library, path)
+    return category
+
+
+def rename_favorite_category(category_id: str, name: str, path: str | Path | None = None) -> bool:
+    clean_name = str(name).strip()
+    if not clean_name or category_id == DEFAULT_CATEGORY_ID:
+        return False
+    library = load_favorite_library(path)
+    category = next((item for item in library["categories"] if item["id"] == category_id), None)
+    if category is None:
+        return False
+    category["name"] = clean_name; save_favorite_library(library, path)
+    return True
+
+
+def delete_favorite_category(category_id: str, path: str | Path | None = None) -> bool:
+    if category_id == DEFAULT_CATEGORY_ID:
+        return False
+    library = load_favorite_library(path)
+    remaining = [category for category in library["categories"] if category["id"] != category_id]
+    if len(remaining) == len(library["categories"]):
+        return False
+    for blogger in library["bloggers"]:
+        if blogger.get("category_id") == category_id:
+            blogger["category_id"] = DEFAULT_CATEGORY_ID
+    library["categories"] = remaining; save_favorite_library(library, path)
+    return True
 
 
 def is_favorite_blogger(profile_url: str, path: str | Path | None = None) -> bool:
@@ -212,6 +297,7 @@ def upsert_favorite_blogger(
     last_seen_aweme_ids: list[str],
     last_checked_at: str | None = None,
     path: str | Path | None = None,
+    category_id: str | None = None,
 ) -> dict[str, Any]:
     """Add or refresh one favorite blogger after a successful profile recognition."""
 
@@ -220,11 +306,15 @@ def upsert_favorite_blogger(
         raise StorageError("收藏博主缺少名称或主页链接")
     favorites = load_favorite_bloggers(path)
     current = next((item for item in favorites if _favorite_profile_url(item["profile_url"]) == normalized_url), None)
+    selected_category_id = category_id or (str(current.get("category_id", DEFAULT_CATEGORY_ID)) if current else DEFAULT_CATEGORY_ID)
+    if selected_category_id not in {category["id"] for category in load_favorite_library(path)["categories"]}:
+        selected_category_id = DEFAULT_CATEGORY_ID
     record = {
         "author": str(author).strip(),
         "profile_url": normalized_url,
         "last_checked_at": last_checked_at or datetime.now().astimezone().isoformat(timespec="seconds"),
         "last_seen_aweme_ids": list(dict.fromkeys(str(value).strip() for value in last_seen_aweme_ids if str(value).strip())),
+        "category_id": selected_category_id,
     }
     if current is None:
         favorites.append(record)
