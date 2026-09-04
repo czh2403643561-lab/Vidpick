@@ -89,6 +89,19 @@ def test_result_fields_and_card_spacing_are_aligned() -> None:
     window.close()
 
 
+def test_main_window_minimum_size_keeps_layout_above_its_size_hint() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+
+    assert window.minimumSize().toTuple() == (860, 800)
+    assert window.minimumSize().width() >= window.minimumSizeHint().width()
+    assert window.minimumSize().height() >= window.minimumSizeHint().height()
+    window.resize(1, 1)
+    assert window.size().width() >= 860
+    assert window.size().height() >= 800
+    window.close()
+
+
 def test_recognize_does_not_start_a_second_worker_when_thread_exists(monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
