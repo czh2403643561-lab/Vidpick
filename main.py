@@ -13,7 +13,7 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QButtonGroup, QScrollArea, QVBoxLayout, QWidget
 
 from douyin_parser import DouyinSession, ProfileInfo, ProfileWork, VideoInfo, extract_profile, extract_video
-from storage import get_collected_aweme_ids, is_collected, save_video
+from storage import get_collected_aweme_ids, is_collected, save_media, save_video
 
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "vidpick-icon.ico"
@@ -46,7 +46,12 @@ class SaveWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self.progress.emit(40, "写入作品内容"); result = save_video(self.info, self.output_root, overwrite=self.overwrite); self.progress.emit(90, "更新 JSONL 记录"); self.succeeded.emit(result)
+            self.progress.emit(35, "写入作品正文")
+            result = save_video(self.info, self.output_root, overwrite=self.overwrite)
+            self.progress.emit(60, "准备保存作品媒体")
+            media = save_media(self.info, result[1].parent, overwrite=self.overwrite, progress=lambda step: self.progress.emit(60, step))
+            self.progress.emit(90, "整理保存结果")
+            self.succeeded.emit((result, media))
         except Exception as exc: self.failed.emit(str(exc) or "保存失败，请检查输出目录权限")
         finally: self.finished.emit()
 
@@ -112,31 +117,55 @@ class WorksSelectionDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
-        super().__init__(); self.setWindowIcon(QIcon(str(ICON_PATH))); self.current_mode = "single"; self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.mode_logs = ModeLogStore(); self._build(); self._style()
+        super().__init__(); self.setWindowIcon(QIcon(str(ICON_PATH))); self.current_mode = "single"; self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.preview_manager = QNetworkAccessManager(self); self.preview_reply = None; self.mode_logs = ModeLogStore(); self._build(); self._style()
     def _build(self) -> None:
-        self.setWindowTitle("Vidpick"); self.resize(900, 760); self.setMinimumSize(760, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
-        title = QLabel("Vidpick"); title.setObjectName("title"); root.addWidget(title)
-        mode_container = QWidget(); mode_container.setObjectName("mode_container"); mode_layout = QHBoxLayout(mode_container); mode_layout.setContentsMargins(4, 4, 4, 4); mode_layout.setSpacing(3); self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True); self.mode_buttons: dict[str, QPushButton] = {}
+        self.setWindowTitle("Vidpick"); self.resize(980, 760); self.setMinimumSize(820, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
+        header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch()
+        mode_container = QWidget(); mode_container.setObjectName("mode_container"); mode_container.setFixedWidth(300); mode_layout = QHBoxLayout(mode_container); mode_layout.setContentsMargins(4, 4, 4, 4); mode_layout.setSpacing(3); self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True); self.mode_buttons: dict[str, QPushButton] = {}
         for mode, label in (("single", "单个作品"), ("batch", "博主批量")):
             button = QPushButton(label); button.setObjectName("mode_button"); button.setCheckable(True); button.setChecked(mode == self.current_mode); button.clicked.connect(lambda _checked, selected_mode=mode: self._mode_changed(selected_mode)); self.mode_group.addButton(button); self.mode_buttons[mode] = button; mode_layout.addWidget(button)
-        root.addWidget(mode_container)
-        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴抖音网页版作品地址"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); root.addWidget(link_group)
-        result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("详情", self.detail); root.addWidget(result)
+        header.addWidget(mode_container); root.addLayout(header)
+
+        info_column = QWidget(); info_layout = QVBoxLayout(info_column); info_layout.setContentsMargins(0, 0, 0, 0); info_layout.setSpacing(14)
+        link_group = QGroupBox("链接"); row = QHBoxLayout(link_group); self.url = QLineEdit(); self.url.setPlaceholderText("粘贴抖音网页版作品地址"); self.url.textChanged.connect(self._reset); self.recognize = QPushButton("识别"); self.recognize.setObjectName("primary"); self.recognize.clicked.connect(self._recognize); row.addWidget(self.url); row.addWidget(self.recognize); info_layout.addWidget(link_group)
+        result = QGroupBox("识别结果"); form = QFormLayout(result); self.status = QLabel("未识别"); self.author = QLabel("—"); self.summary = QLabel("—"); self.summary.setWordWrap(True); self.work_type = QLabel("—"); self.detail = QLabel("识别成功后显示作品信息"); self.detail.setWordWrap(True); form.addRow("状态", self.status); form.addRow("博主", self.author); form.addRow("作品", self.summary); form.addRow("类型", self.work_type); form.addRow("详情", self.detail); info_layout.addWidget(result)
+        self.preview_card = QGroupBox("作品预览"); self.preview_card.setFixedWidth(230); preview_layout = QVBoxLayout(self.preview_card); self.preview_image = QLabel("暂无预览"); self.preview_image.setObjectName("preview_image"); self.preview_image.setAlignment(Qt.AlignCenter); self.preview_image.setWordWrap(True); self.preview_image.setFixedSize(200, 220); preview_layout.addWidget(self.preview_image, alignment=Qt.AlignCenter)
+        info_row = QHBoxLayout(); info_row.setSpacing(14); info_row.addWidget(info_column, 1); info_row.addWidget(self.preview_card); root.addLayout(info_row)
         task = QGroupBox("任务"); task_layout = QVBoxLayout(task); top = QHBoxLayout(); self.step = QLabel("等待识别"); top.addWidget(self.step); top.addStretch(); self.select_works = QPushButton("选择作品"); self.select_works.setEnabled(False); self.select_works.setVisible(False); self.select_works.clicked.connect(self._choose_works); top.addWidget(self.select_works); self.start = QPushButton("开始任务"); self.start.setEnabled(False); self.start.clicked.connect(self._start); top.addWidget(self.start); task_layout.addLayout(top); self.progress = QProgressBar(); self.progress.setValue(0); task_layout.addWidget(self.progress); root.addWidget(task)
         log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
     def _style(self) -> None:
-        self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:8px 20px;min-height:18px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
+        self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QPushButton#primary:disabled{background:#b8bdc7;color:#737983} QWidget#mode_container{background:#e9eef7;border-radius:12px} QPushButton#mode_button{background:transparent;color:#667085;border-radius:9px;padding:7px 12px;min-height:16px} QPushButton#mode_button:hover{background:#dce5f4;color:#334155} QPushButton#mode_button:checked{background:#355fc1;color:white} QPushButton#mode_button:disabled{color:#a8abb2;background:transparent} QLabel#preview_image{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px;color:#8992a3;padding:6px} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
     def _mode_key(self) -> str: return self.current_mode
     def _log(self, text: str) -> None:
         line = f"[{datetime.now():%H:%M:%S}] {text}"; self.mode_logs.append(self._mode_key(), line); self.logs.appendPlainText(line); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
     def _show_mode_log(self) -> None:
         self.logs.setPlainText(self.mode_logs.text(self._mode_key())); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
+    def _set_preview_message(self, text: str) -> None:
+        self.preview_reply = None
+        self.preview_image.setPixmap(QPixmap()); self.preview_image.setText(text)
+    def _load_preview(self, url: str) -> None:
+        if not url:
+            self._set_preview_message("预览不可用"); return
+        self._set_preview_message("正在加载预览…")
+        reply = self.preview_manager.get(QNetworkRequest(QUrl(url))); self.preview_reply = reply
+        def done() -> None:
+            if reply is not self.preview_reply:
+                reply.deleteLater(); return
+            data = reply.readAll(); self.preview_reply = None; pixmap = QPixmap(); reply.deleteLater()
+            if pixmap.loadFromData(data):
+                self.preview_image.setText(""); self.preview_image.setPixmap(pixmap.scaled(190, 210, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self._set_preview_message("预览不可用")
+        reply.finished.connect(done)
+    def _work_type_text(self, info: VideoInfo) -> str:
+        return f"图文 · {len(info.image_urls)} 张" if info.work_type == "image" else "视频"
     def _mode_changed(self, mode: str) -> None:
         if mode == self.current_mode: return
-        self.current_mode = mode; self.mode_buttons[mode].setChecked(True); self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if mode == "batch" else "粘贴抖音网页版作品地址"); self.select_works.setVisible(mode == "batch"); self.select_works.setText("选择作品"); self._show_mode_log(); self._reset()
+        self.current_mode = mode; self.mode_buttons[mode].setChecked(True); self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if mode == "batch" else "粘贴抖音网页版作品地址"); self.select_works.setVisible(mode == "batch"); self.select_works.setText("选择作品"); self.preview_card.setVisible(mode == "single"); self._show_mode_log(); self._reset()
     def _reset(self, *_args) -> None:
         if self.thread: return
-        self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.select_works.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
+        self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.select_works.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.work_type.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")
+        if self.current_mode == "single": self._set_preview_message("暂无预览")
     def _set_busy(self, busy: bool) -> None:
         for button in self.mode_buttons.values(): button.setEnabled(not busy)
         self.url.setEnabled(not busy); self.recognize.setEnabled(not busy); self.select_works.setEnabled(not busy and self.profile is not None); self.start.setEnabled(not busy and bool(self.single or self.selected))
@@ -144,7 +173,9 @@ class MainWindow(QMainWindow):
         if self.thread is not None: return
         if not self.url.text().strip(): self.status.setText("失败：请输入链接"); return
         self._set_busy(True)
-        self._reset(); self.status.setText("识别中…"); self.step.setText("准备识别"); self.progress.setValue(5); self._run(RecognitionWorker(self.current_mode, self.url.text()))
+        self._reset(); self.status.setText("识别中…"); self.step.setText("准备识别"); self.progress.setValue(5)
+        if self.current_mode == "single": self._set_preview_message("正在获取作品信息…")
+        self._run(RecognitionWorker(self.current_mode, self.url.text()))
     def _start(self) -> None:
         if self.thread is not None: return
         root = Path(__file__).resolve().parent / "output"; self.open_folder.setEnabled(False)
@@ -191,9 +222,9 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _recognized(self, result: object) -> None:
         self.progress.setValue(100)
-        if isinstance(result, VideoInfo): self.single = result; self.select_works.setVisible(False); self.author.setText(result.author); self.summary.setText(result.title); self.detail.setText(result.content[:240] + ("…" if len(result.content) > 240 else "")); self.status.setText("成功"); self.step.setText("识别完成，可以开始任务"); self._log(f"识别成功：{result.author} / {result.title}")
+        if isinstance(result, VideoInfo): self.single = result; self.select_works.setVisible(False); self.author.setText(result.author); self.summary.setText(result.title); self.work_type.setText(self._work_type_text(result)); self.detail.setText(result.content[:240] + ("…" if len(result.content) > 240 else "")); self.status.setText("成功"); self.step.setText("识别完成，可以开始任务"); self._load_preview(result.cover_url); self._log(f"识别成功：{result.author} / {result.title} · {self._work_type_text(result)}")
         else:
-            self.profile = result; self.select_works.setVisible(True); self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.detail.setText("请选择要采集的作品"); self.status.setText("成功"); self.select_works.setEnabled(True); self._log(f"识别成功：{result.author}，共 {len(result.works)} 个作品"); self._choose_works()
+            self.profile = result; self.preview_card.setVisible(False); self.select_works.setVisible(True); self.author.setText(result.author); self.summary.setText(f"识别到 {len(result.works)} 个公开作品"); self.work_type.setText("—"); self.detail.setText("请选择要采集的作品"); self.status.setText("成功"); self.select_works.setEnabled(True); self._log(f"识别成功：{result.author}，共 {len(result.works)} 个作品"); self._choose_works()
     def _choose_works(self) -> None:
         if not self.profile: return
         dialog = WorksSelectionDialog(self.profile, self)
@@ -203,14 +234,25 @@ class MainWindow(QMainWindow):
     @Slot(int, int, str, str)
     def _batch_progress(self, index: int, total: int, title: str, step: str) -> None: self.progress.setValue(int((index - 1) * 100 / total)); self.step.setText(f"当前 {index}/{total}：{_short(title, 36)} — {step}")
     @Slot(object)
-    def _saved(self, result: object) -> None: self.output_dir, content_path, when = result; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True); self._log(f"保存成功：{self.single.title if self.single else content_path.parent.name}")
+    def _saved(self, result: object) -> None:
+        save_result, media = result; self.output_dir, content_path, when = save_result; self.progress.setValue(100); self.status.setText("成功"); self.step.setText("任务完成"); self.open_folder.setEnabled(True)
+        title = self.single.title if self.single else content_path.parent.name
+        if self.single and self.single.work_type == "image":
+            message = f"保存成功：{title} · 正文 + {media.saved} 张图片" if media.saved == media.total else f"保存完成：{title} · 正文成功，图片 {media.saved}/{media.total}"
+        elif media.cover_saved:
+            message = f"保存成功：{title} · 正文 + 封面"
+        elif self.single and self.single.cover_url:
+            message = f"保存完成：{title} · 正文成功，封面未保存"
+        else:
+            message = f"保存成功：{title} · 正文"
+        self._log(message)
     @Slot(object)
     def _batch_done(self, result: object) -> None:
-        folder, success, skipped, failed, elapsed = result; self.output_dir = folder; self.progress.setValue(100); self.status.setText("完成" if not failed else "完成（含失败项）"); self.step.setText(f"批量完成：成功 {success} / 跳过 {skipped} / 失败 {failed}"); self.open_folder.setEnabled(folder is not None); self._log(f"批量结束：成功 {success}，跳过 {skipped}，失败 {failed}，耗时 {elapsed:.1f} 秒")
+        folder, success, skipped, failed, elapsed = result; self.output_dir = folder; self.progress.setValue(100); self.status.setText("完成" if not failed else "完成（含失败项）"); self.step.setText(f"批量完成：成功 {success} / 跳过 {skipped} / 失败 {failed}"); self.open_folder.setEnabled(folder is not None); self._log(f"批量完成：成功 {success}，跳过 {skipped}，失败 {failed}，耗时 {elapsed:.1f} 秒")
     @Slot(str)
     def _failed(self, message: str) -> None: self.status.setText("失败"); self.step.setText("任务失败，可修正后重试"); self.progress.setValue(0)
     @Slot(str)
-    def _recognition_failed(self, message: str) -> None: self._failed(message); self._log(f"识别失败：{message}")
+    def _recognition_failed(self, message: str) -> None: self._failed(message); self._set_preview_message("预览不可用") if self.current_mode == "single" else None; self._log(f"识别失败：{message}")
     @Slot(str)
     def _save_failed(self, message: str) -> None: self._failed(message); self._log(f"保存失败：{message}")
     @Slot(str)

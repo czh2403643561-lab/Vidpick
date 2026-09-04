@@ -3,7 +3,8 @@ import json
 import pytest
 
 from douyin_parser import VideoInfo
-from storage import AlreadyCollectedError, get_author_dir, get_work_dir, is_collected, save_video, safe_filename
+import storage
+from storage import AlreadyCollectedError, get_author_dir, get_work_dir, is_collected, save_media, save_video, safe_filename
 
 
 def test_safe_filename_handles_windows_names() -> None:
@@ -34,7 +35,7 @@ def test_save_video_uses_id_work_folder_and_preserves_old_flat_file(tmp_path) ->
     assert list(author_dir.glob("*.txt")) == [old_flat]
 
     record = json.loads((author_dir / "data.jsonl").read_text(encoding="utf-8"))
-    assert {"aweme_id", "author", "title", "url", "content", "collected_at"} <= record.keys()
+    assert {"aweme_id", "author", "title", "url", "content", "work_type", "cover_url", "image_urls", "collected_at"} <= record.keys()
 
 
 def test_duplicate_save_requires_overwrite_and_upserts_one_record(tmp_path) -> None:
@@ -76,3 +77,83 @@ def test_legacy_jsonl_url_is_used_for_duplicate_detection_without_deleting_unkno
     assert len(records) == 2
     assert any(record.get("url") == "https://www.douyin.com/user/self" for record in records)
     assert sum(record.get("aweme_id") == "123" for record in records) == 1
+
+
+def test_save_image_media_rebuilds_only_managed_files_and_reuses_first_download(monkeypatch, tmp_path) -> None:
+    work_dir = tmp_path / "测试博主" / "作品__123"
+    images_dir = work_dir / "images"
+    images_dir.mkdir(parents=True)
+    (work_dir / "cover.jpg").write_bytes(b"old-cover")
+    (images_dir / "01.jpg").write_bytes(b"old-1")
+    (images_dir / "03.jpg").write_bytes(b"old-3")
+    (work_dir / "future-file.bin").write_bytes(b"keep")
+    calls: list[str] = []
+
+    def fake_download(url: str, stem):
+        calls.append(url)
+        path = stem.with_suffix(".webp")
+        path.write_bytes(url.encode())
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    info = VideoInfo(
+        "测试博主", "作品", "正文", "https://www.douyin.com/note/123", "123",
+        work_type="image", image_urls=("https://image/one", "https://image/two"),
+    )
+
+    result = save_media(info, work_dir, overwrite=True)
+
+    assert result.total == result.saved == 2
+    assert result.cover_saved
+    assert calls == ["https://image/one", "https://image/two"]
+    assert sorted(path.name for path in (work_dir / "images").iterdir()) == ["01.webp", "02.webp"]
+    assert (work_dir / "cover.webp").read_bytes() == b"https://image/one"
+    assert (work_dir / "future-file.bin").read_bytes() == b"keep"
+
+
+def test_media_download_failure_keeps_saved_content(monkeypatch, tmp_path) -> None:
+    info = VideoInfo(
+        "测试博主", "作品", "正文", "https://www.douyin.com/note/123", "123",
+        work_type="image", image_urls=("https://image/one", "https://image/two"),
+    )
+    _, content_path, _ = save_video(info, tmp_path)
+
+    def fake_download(url: str, stem):
+        if url.endswith("two"):
+            raise OSError("network failed")
+        path = stem.with_suffix(".jpg")
+        path.write_bytes(b"image")
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    result = save_media(info, content_path.parent)
+
+    assert (result.total, result.saved, result.cover_saved) == (2, 1, True)
+    assert content_path.read_text(encoding="utf-8") == "正文\n"
+    assert (content_path.parent / "images" / "01.jpg").exists()
+    assert not (content_path.parent / "images" / "02.jpg").exists()
+
+
+def test_save_video_media_only_downloads_cover(monkeypatch, tmp_path) -> None:
+    work_dir = tmp_path / "测试博主" / "视频__456"
+    work_dir.mkdir(parents=True)
+    calls: list[str] = []
+
+    def fake_download(url: str, stem):
+        calls.append(url)
+        path = stem.with_suffix(".jpg")
+        path.write_bytes(b"cover")
+        return path
+
+    monkeypatch.setattr(storage, "_download_to_stem", fake_download)
+    info = VideoInfo(
+        "测试博主", "视频", "正文", "https://www.douyin.com/video/456", "456",
+        work_type="video", cover_url="https://cover/video.jpg",
+    )
+
+    result = save_media(info, work_dir)
+
+    assert (result.total, result.saved, result.cover_saved) == (1, 1, True)
+    assert calls == ["https://cover/video.jpg"]
+    assert (work_dir / "cover.jpg").exists()
+    assert not (work_dir / "images").exists()

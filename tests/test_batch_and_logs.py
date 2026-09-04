@@ -4,6 +4,7 @@ import pytest
 
 import main
 from douyin_parser import ProfileWork, VideoInfo
+from storage import MediaSaveResult
 from PySide6.QtWidgets import QApplication
 
 
@@ -75,6 +76,40 @@ def test_mode_logs_remain_independent_and_window_has_icon() -> None:
     window._log("批量日志")
     window.mode_buttons["single"].click()
     assert window.logs.toPlainText().endswith("单个日志")
+    window.close()
+
+
+def test_single_mode_shows_media_type_and_preview_card_but_batch_hides_it() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    info = VideoInfo(
+        "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", image_urls=("https://image/1.webp", "https://image/2.webp"),
+    )
+
+    window._recognized(info)
+
+    assert window.work_type.text() == "图文 · 2 张"
+    assert not window.preview_card.isHidden()
+    assert window.preview_image.text() == "预览不可用"
+    window.mode_buttons["batch"].click()
+    assert window.preview_card.isHidden()
+    window.mode_buttons["single"].click()
+    assert not window.preview_card.isHidden()
+    window.close()
+
+
+def test_single_save_log_reports_partial_image_download() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    window.single = VideoInfo(
+        "测试博主", "图文作品", "正文", "https://www.douyin.com/note/1", "1",
+        work_type="image", image_urls=("https://image/1.webp", "https://image/2.webp"),
+    )
+
+    window._saved(((Path("output") / "测试博主", Path("output") / "测试博主" / "作品__1" / "content.txt", "2026-09-04"), MediaSaveResult(total=2, saved=1, cover_saved=True)))
+
+    assert "保存完成：图文作品 · 正文成功，图片 1/2" in window.logs.toPlainText()
     window.close()
 
 

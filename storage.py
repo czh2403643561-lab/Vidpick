@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 from pathlib import Path
 import re
-from typing import Any
+import shutil
+import tempfile
+from typing import Any, Callable
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from douyin_parser import VideoInfo, extract_target_aweme_id
 
@@ -18,6 +22,13 @@ class StorageError(RuntimeError):
 
 class AlreadyCollectedError(StorageError):
     """Raised when a new save would overwrite an existing work."""
+
+
+@dataclass(frozen=True)
+class MediaSaveResult:
+    total: int = 0
+    saved: int = 0
+    cover_saved: bool = False
 
 
 def safe_filename(value: str, fallback: str, max_length: int = 100) -> str:
@@ -161,3 +172,89 @@ def save_video(
     record["collected_at"] = collected_at
     upsert_jsonl(author_dir, record)
     return author_dir.resolve(), content_path.resolve(), collected_at
+
+
+def save_media(
+    info: VideoInfo,
+    work_dir: Path,
+    *,
+    overwrite: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> MediaSaveResult:
+    """Download only Vidpick-managed media without risking the saved正文."""
+
+    if overwrite:
+        _clear_managed_media(work_dir)
+
+    report = progress or (lambda _message: None)
+    if info.work_type == "image" and info.image_urls:
+        image_dir = work_dir / "images"
+        image_dir.mkdir(exist_ok=True)
+        saved = 0
+        first_image: Path | None = None
+        for index, url in enumerate(info.image_urls, 1):
+            report(f"下载图片 {index}/{len(info.image_urls)}")
+            try:
+                image_path = _download_to_stem(url, image_dir / f"{index:02d}")
+            except Exception:
+                continue
+            saved += 1
+            if index == 1:
+                first_image = image_path
+        if first_image is not None:
+            _copy_as_cover(first_image, work_dir)
+        return MediaSaveResult(total=len(info.image_urls), saved=saved, cover_saved=first_image is not None)
+
+    if info.cover_url:
+        report("下载作品封面")
+        try:
+            _download_to_stem(info.cover_url, work_dir / "cover")
+            return MediaSaveResult(total=1, saved=1, cover_saved=True)
+        except Exception:
+            return MediaSaveResult(total=1, saved=0, cover_saved=False)
+    return MediaSaveResult()
+
+
+def _clear_managed_media(work_dir: Path) -> None:
+    for path in work_dir.glob("cover.*"):
+        if path.is_file():
+            path.unlink()
+    image_dir = work_dir / "images"
+    if image_dir.exists() and image_dir.is_dir():
+        shutil.rmtree(image_dir)
+
+
+def _copy_as_cover(source: Path, work_dir: Path) -> None:
+    for path in work_dir.glob("cover.*"):
+        if path.is_file():
+            path.unlink()
+    destination = work_dir / f"cover{source.suffix or '.jpg'}"
+    temp_path = destination.with_suffix(destination.suffix + ".tmp")
+    shutil.copyfile(source, temp_path)
+    temp_path.replace(destination)
+
+
+def _download_to_stem(url: str, stem: Path) -> Path:
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    temporary_path: Path | None = None
+    try:
+        with urlopen(request, timeout=15) as response:
+            extension = _media_extension(response.headers.get_content_type(), url)
+            destination = stem.with_suffix(extension)
+            with tempfile.NamedTemporaryFile(delete=False, dir=destination.parent, suffix=".part") as handle:
+                temporary_path = Path(handle.name)
+                shutil.copyfileobj(response, handle)
+        temporary_path.replace(destination)
+        return destination
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
+
+def _media_extension(content_type: str, url: str) -> str:
+    known = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+    if content_type.lower() in known:
+        return known[content_type.lower()]
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else ".jpg"

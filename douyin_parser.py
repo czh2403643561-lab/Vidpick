@@ -25,6 +25,9 @@ class VideoInfo:
     content: str
     url: str
     aweme_id: str = ""
+    work_type: str = "video"
+    cover_url: str = ""
+    image_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,7 +378,65 @@ def _works_from_awemes(items: Iterable[dict[str, Any]]) -> list[ProfileWork]:
 def _video_from_aweme(item: dict[str, Any], url: str) -> VideoInfo:
     author = _clean_text(item.get("author", {}).get("nickname", "")) if isinstance(item.get("author"), dict) else ""
     desc = _clean_text(item.get("desc", ""))
-    return VideoInfo(author=author, title=_first_line(desc, 80) or "未命名作品", content=desc, url=url, aweme_id=str(item.get("aweme_id", "")))
+    work_type, cover_url, image_urls = _media_from_aweme(item)
+    return VideoInfo(
+        author=author,
+        title=_first_line(desc, 80) or "未命名作品",
+        content=desc,
+        url=url,
+        aweme_id=str(item.get("aweme_id", "")),
+        work_type=work_type,
+        cover_url=cover_url,
+        image_urls=image_urls,
+    )
+
+
+def _media_from_aweme(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    """Read media only from the already verified target aweme object."""
+
+    images = item.get("images")
+    if isinstance(images, list):
+        image_urls: list[str] = []
+        seen: set[str] = set()
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            media_url = _best_image_url(image)
+            if media_url and media_url not in seen:
+                seen.add(media_url)
+                image_urls.append(media_url)
+        if image_urls:
+            return "image", image_urls[0], tuple(image_urls)
+
+    video = item.get("video")
+    cover_url = ""
+    if isinstance(video, dict):
+        for key in ("origin_cover", "cover"):
+            cover_url = _first_url(video.get(key))
+            if cover_url:
+                break
+    return "video", cover_url, ()
+
+
+def _best_image_url(image: dict[str, Any]) -> str:
+    """Prefer Douyin's original/download URLs over display thumbnail URLs."""
+
+    for key in ("download_url_list", "url_list"):
+        urls = image.get(key)
+        if isinstance(urls, list):
+            for value in urls:
+                if isinstance(value, str) and value.startswith(("https://", "http://")):
+                    return value
+    return ""
+
+
+def _first_url(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    urls = value.get("url_list")
+    if not isinstance(urls, list):
+        return ""
+    return next((url for url in urls if isinstance(url, str) and url.startswith(("https://", "http://"))), "")
 
 
 def _read_profile_cards(page) -> list[dict[str, str]]:

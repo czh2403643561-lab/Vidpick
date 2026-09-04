@@ -1,6 +1,6 @@
 import pytest
 
-from douyin_parser import DouyinParseError, DouyinSession, _find_aweme_object, canonical_work_url, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
+from douyin_parser import DouyinParseError, DouyinSession, _find_aweme_object, _video_from_aweme, canonical_work_url, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -122,6 +122,35 @@ def test_target_html_returns_the_verified_aweme_id() -> None:
     html = '<script type="application/json">{"aweme_list":[{"aweme_id":"123","desc":"目标正文","author":{"nickname":"测试博主"}}]}</script>'
 
     assert parse_target_html(html, "https://www.douyin.com/video/123", "123").aweme_id == "123"
+
+
+def test_target_aweme_media_prefers_original_image_urls_and_keeps_order() -> None:
+    info = _video_from_aweme({
+        "aweme_id": "123",
+        "desc": "图文作品",
+        "author": {"nickname": "测试博主"},
+        "images": [
+            {"download_url_list": ["https://image/original-1.webp"], "url_list": ["https://image/thumb-1.webp"]},
+            {"download_url_list": ["https://image/original-1.webp"], "url_list": ["https://image/thumb-duplicate.webp"]},
+            {"url_list": ["https://image/display-2.webp"]},
+        ],
+    }, "https://www.douyin.com/note/123")
+
+    assert info.aweme_id == "123"
+    assert info.work_type == "image"
+    assert info.cover_url == "https://image/original-1.webp"
+    assert info.image_urls == ("https://image/original-1.webp", "https://image/display-2.webp")
+
+
+def test_target_aweme_video_uses_its_own_cover_without_images() -> None:
+    info = _video_from_aweme({
+        "aweme_id": "456",
+        "desc": "视频作品",
+        "author": {"nickname": "测试博主"},
+        "video": {"origin_cover": {"url_list": ["https://cover/original.jpg"]}},
+    }, "https://www.douyin.com/video/456")
+
+    assert (info.work_type, info.cover_url, info.image_urls) == ("video", "https://cover/original.jpg", ())
 
 
 def test_target_html_fails_closed_when_only_other_work_exists() -> None:
