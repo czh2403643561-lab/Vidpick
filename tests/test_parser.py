@@ -1,4 +1,6 @@
-from douyin_parser import normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page
+import pytest
+
+from douyin_parser import DouyinParseError, _find_aweme_object, extract_target_aweme_id, normalize_douyin_url, normalize_profile_cards, parse_html, parse_profile_page, parse_target_html
 
 
 def test_parse_html_uses_metadata_and_embedded_data() -> None:
@@ -71,3 +73,29 @@ def test_profile_cards_keep_structured_fields() -> None:
         "desc": "完整正文",
     }])[0]
     assert (work.aweme_id, work.author, work.desc) == ("123", "博主", "完整正文")
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://www.douyin.com/video/123", "123"),
+    ("https://www.douyin.com/note/123", "123"),
+    ("https://www.douyin.com/user/self?from_tab_name=main&modal_id=123&showTab=like", "123"),
+    ("https://www.douyin.com/user/self?vid=123", "123"),
+])
+def test_extract_target_aweme_id(url, expected) -> None:
+    assert extract_target_aweme_id(url) == expected
+
+
+def test_target_lookup_ignores_response_order() -> None:
+    payload = {"aweme_list": [{"aweme_id": "111"}, {"aweme_id": "123"}, {"aweme_id": "999"}]}
+    assert _find_aweme_object(payload, "123")["aweme_id"] == "123"
+    assert _find_aweme_object(payload, "555") is None
+
+
+def test_target_html_fails_closed_when_only_other_work_exists() -> None:
+    html = '<script type="application/json">{"aweme_list":[{"aweme_id":"111","desc":"别的作品"}]}</script>'
+    with pytest.raises(DouyinParseError, match="未能确认目标"):
+        parse_target_html(html, "https://www.douyin.com/video/123", "123")
+
+
+def test_homepage_without_work_id_is_not_a_single_work() -> None:
+    assert extract_target_aweme_id("https://www.douyin.com/user/abc") is None

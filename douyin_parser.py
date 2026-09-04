@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any, Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -67,6 +67,23 @@ def normalize_douyin_url(value: str) -> str:
     if not parsed.path or parsed.path == "/":
         raise DouyinParseError("链接中没有发现作品地址")
     return value
+
+
+def extract_target_aweme_id(value: str) -> str | None:
+    """Return only the concrete work ID encoded by a Douyin URL or share text."""
+    try:
+        url = normalize_douyin_url(value)
+    except DouyinParseError:
+        return None
+    parsed = urlparse(url)
+    match = re.search(r"/(?:video|note)/(\d+)", parsed.path)
+    if match:
+        return match.group(1)
+    query = parse_qs(parsed.query)
+    for key in ("modal_id", "vid", "aweme_id"):
+        if query.get(key) and re.fullmatch(r"\d+", query[key][0]):
+            return query[key][0]
+    return None
 
 
 def extract_video(url: str, progress: ProgressCallback | None = None) -> VideoInfo:
@@ -128,22 +145,27 @@ class DouyinSession:
 
     def extract_video(self, url: str, progress: ProgressCallback | None = None) -> VideoInfo:
         normalized_url = normalize_douyin_url(url)
+        requested_target = extract_target_aweme_id(normalized_url)
+        if not requested_target and "/user/" in urlparse(normalized_url).path:
+            raise DouyinParseError("这是博主主页链接，请切换到博主主页批量模式")
         page = self._require_page()
         report = progress or self._report
         try:
             self._awemes.clear()
             report("打开作品链接并等待跳转")
             page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
-            self._wait_for_page(page)
+            target = extract_target_aweme_id(page.url) or requested_target
+            if not target:
+                raise DouyinParseError("未能确认目标作品 ID，请重试")
+            report("等待目标作品数据")
+            matched = self._wait_for_target_aweme(target)
             report("读取页面数据")
-            page_html = page.content()
-            body_text = _body_text(page)
             report("解析作者和作品正文")
-            if self._awemes:
-                structured = _video_from_aweme(self._awemes[-1], page.url or normalized_url)
+            if matched:
+                structured = _video_from_aweme(matched, page.url or normalized_url)
                 if structured.content:
                     return structured
-            return parse_html(page_html, page.url or normalized_url, body_text)
+            return parse_target_html(page.content(), page.url or normalized_url, target)
         except DouyinParseError:
             raise
         except Exception as exc:
@@ -203,6 +225,14 @@ class DouyinSession:
             raise DouyinParseError("浏览器会话尚未启动")
         return self._page
 
+    def _wait_for_target_aweme(self, target: str) -> dict[str, Any] | None:
+        for _ in range(25):
+            for item in self._awemes:
+                if str(item.get("aweme_id", "")) == target:
+                    return item
+            self._page.wait_for_timeout(200)
+        return None
+
     def _capture_response(self, response) -> None:
         if "/aweme/" not in response.url or "json" not in response.headers.get("content-type", "").lower():
             return
@@ -235,6 +265,33 @@ def parse_profile_page(
             raise DouyinParseError("需要登录：当前链接依赖登录状态")
         raise DouyinParseError("未识别到可访问的公开作品，可能需要登录或页面受限")
     return ProfileInfo(author=author, url=final_url, works=works)
+
+
+def parse_target_html(page_html: str, final_url: str, target_aweme_id: str) -> VideoInfo:
+    """Fail closed: only parse an embedded object that proves it is the requested work."""
+    for obj in _extract_json_objects(page_html):
+        found = _find_aweme_object(obj, target_aweme_id)
+        if found:
+            info = _video_from_aweme(found, final_url)
+            if info.author and info.content:
+                return info
+    raise DouyinParseError("未能确认目标作品数据，请重试")
+
+
+def _find_aweme_object(value: Any, target_aweme_id: str) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if str(value.get("aweme_id", "")) == target_aweme_id:
+            return value
+        for child in value.values():
+            found = _find_aweme_object(child, target_aweme_id)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_aweme_object(child, target_aweme_id)
+            if found:
+                return found
+    return None
 
 
 def normalize_profile_cards(cards: Iterable[dict[str, str]]) -> list[ProfileWork]:
