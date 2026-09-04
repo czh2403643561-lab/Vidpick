@@ -16,6 +16,17 @@ from douyin_parser import DouyinSession, ProfileInfo, ProfileWork, VideoInfo, ex
 from storage import save_video
 
 
+class ModeLogStore:
+    def __init__(self) -> None:
+        self._lines = {"single": [], "batch": []}
+
+    def append(self, mode: str, line: str) -> None:
+        self._lines[mode].append(line)
+
+    def text(self, mode: str) -> str:
+        return "\n".join(self._lines[mode])
+
+
 class RecognitionWorker(QObject):
     progress = Signal(str); succeeded = Signal(object); failed = Signal(str); finished = Signal()
     def __init__(self, mode: str, url: str) -> None: super().__init__(); self.mode = mode; self.url = url
@@ -85,7 +96,7 @@ class WorksSelectionDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
-        super().__init__(); self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self._build(); self._style(); self._log("应用已启动")
+        super().__init__(); self.single: VideoInfo | None = None; self.profile: ProfileInfo | None = None; self.selected: list[ProfileWork] = []; self.output_dir: Path | None = None; self.thread: QThread | None = None; self.worker: QObject | None = None; self.mode_logs = ModeLogStore(); self._build(); self._style(); self._log("应用已启动")
     def _build(self) -> None:
         self.setWindowTitle("Vidpick"); self.resize(900, 760); self.setMinimumSize(760, 650); central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central); root.setContentsMargins(30, 26, 30, 26); root.setSpacing(14)
         header = QHBoxLayout(); title = QLabel("Vidpick"); title.setObjectName("title"); header.addWidget(title); header.addStretch(); self.mode = QComboBox(); self.mode.addItems(["单个链接", "博主主页批量"]); self.mode.currentIndexChanged.connect(self._mode_changed); header.addWidget(self.mode); root.addLayout(header)
@@ -95,8 +106,12 @@ class MainWindow(QMainWindow):
         log_box = QGroupBox("状态 / 日志"); log_layout = QVBoxLayout(log_box); self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMinimumHeight(150); log_layout.addWidget(self.logs); root.addWidget(log_box, 1); footer = QHBoxLayout(); footer.addStretch(); self.open_folder = QPushButton("打开保存文件夹"); self.open_folder.setEnabled(False); self.open_folder.clicked.connect(self._open_folder); footer.addWidget(self.open_folder); root.addLayout(footer)
     def _style(self) -> None:
         self.setStyleSheet("QMainWindow,QWidget{background:#f5f6f8;color:#1d1d1f} QGroupBox{background:white;border:1px solid #e1e4e9;border-radius:14px;margin-top:10px;padding-top:12px;font-weight:600} QGroupBox::title{left:14px;padding:0 4px} QLabel#title{font-size:28px;font-weight:700} QLineEdit,QPlainTextEdit,QComboBox{background:#fbfbfc;border:1px solid #dfe2e8;border-radius:10px;padding:9px} QPushButton{background:#edf0f5;border:none;border-radius:10px;padding:10px 16px;font-weight:600} QPushButton#primary{background:#2775e8;color:white} QPushButton:disabled{color:#a8abb2;background:#eceef2} QProgressBar{border:none;border-radius:6px;background:#e8ebf1;height:14px;text-align:center} QProgressBar::chunk{background:#2775e8;border-radius:6px}")
-    def _log(self, text: str) -> None: self.logs.appendPlainText(f"[{datetime.now():%H:%M:%S}] {text}")
-    def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴 douyin.com 作品分享链接"); self._reset()
+    def _mode_key(self) -> str: return "batch" if self.mode.currentIndex() else "single"
+    def _log(self, text: str) -> None:
+        line = f"[{datetime.now():%H:%M:%S}] {text}"; self.mode_logs.append(self._mode_key(), line); self.logs.appendPlainText(line); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
+    def _show_mode_log(self) -> None:
+        self.logs.setPlainText(self.mode_logs.text(self._mode_key())); self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
+    def _mode_changed(self, index: int) -> None: self.url.setPlaceholderText("粘贴 douyin.com 博主主页分享链接" if index else "粘贴 douyin.com 作品分享链接"); self._show_mode_log(); self._reset()
     def _reset(self, *_args) -> None:
         if self.thread: return
         self.single = None; self.profile = None; self.selected = []; self.start.setEnabled(False); self.open_folder.setEnabled(False); self.status.setText("未识别"); self.author.setText("—"); self.summary.setText("—"); self.detail.setText("识别成功后显示作品信息"); self.progress.setValue(0); self.step.setText("等待识别")

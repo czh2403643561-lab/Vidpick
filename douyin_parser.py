@@ -115,17 +115,18 @@ class DouyinSession:
             self._playwright.stop()
         self._page = self._context = self._browser = self._playwright = None
 
-    def extract_video(self, url: str) -> VideoInfo:
+    def extract_video(self, url: str, progress: ProgressCallback | None = None) -> VideoInfo:
         normalized_url = normalize_douyin_url(url)
         page = self._require_page()
+        report = progress or self._report
         try:
-            self._report("打开作品链接并等待跳转")
+            report("打开作品链接并等待跳转")
             page.goto(normalized_url, wait_until="domcontentloaded", timeout=35_000)
             self._wait_for_page(page)
-            self._report("读取页面数据")
+            report("读取页面数据")
             page_html = page.content()
             body_text = _body_text(page)
-            self._report("解析作者和作品正文")
+            report("解析作者和作品正文")
             return parse_html(page_html, page.url or normalized_url, body_text)
         except DouyinParseError:
             raise
