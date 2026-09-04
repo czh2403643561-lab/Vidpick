@@ -1,0 +1,32 @@
+from douyin_parser import parse_html
+
+
+def test_parse_html_uses_metadata_and_embedded_data() -> None:
+    page = """
+    <html><head>
+      <title>小明的抖音 - 抖音</title>
+      <meta property="og:title" content="春日记录">
+      <meta property="og:description" content="这是一段完整的作品正文，来自页面元数据。">
+      <script type="application/ld+json">
+        {"@type":"VideoObject","name":"春日记录","description":"这是一段完整的作品正文，来自页面元数据。","author":{"@type":"Person","name":"小明"}}
+      </script>
+    </head><body><h1>春日记录</h1></body></html>
+    """
+    info = parse_html(page, "https://www.douyin.com/video/123")
+
+    assert info.author == "小明"
+    assert info.title == "春日记录"
+    assert "完整的作品正文" in info.content
+    assert info.url.endswith("/123")
+
+
+def test_parse_html_falls_back_to_rendered_text() -> None:
+    page = """
+    <html><head><title>小红的抖音</title></head>
+    <body><main><h1>旅行日记</h1><p>这是一段渲染后的完整正文内容，用于验证页面文本 fallback。</p></main></body></html>
+    """
+    info = parse_html(page, "https://v.douyin.com/abc", "小红的抖音\n旅行日记\n这是一段渲染后的完整正文内容，用于验证页面文本 fallback。")
+
+    assert info.author == "小红"
+    assert info.title == "旅行日记"
+    assert "渲染后的完整正文" in info.content

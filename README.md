@@ -28,3 +28,15 @@ Vidpick 是一个本地桌面抖音文案采集工具。
 - UI 保持简洁现代，偏 iOS 设计语言。
 - 优先快速落地和稳定使用，避免过度设计。
 - 第一阶段不做视频下载、图片下载、主页全量采集、AI 分析或其他扩展功能。
+
+## 运行说明
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+python main.py
+```
+
+采集结果默认保存到项目目录下的 `output/<博主名>/`。
