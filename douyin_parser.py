@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import html as html_lib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Iterable
@@ -56,7 +57,7 @@ class ProfileInfo:
 
 
 ProgressCallback = Callable[[str], None]
-PROFILE_DIR = Path(__file__).resolve().parent / "browser_profile"
+PROFILE_DIR = Path(os.environ.get("VIDPICK_PROFILE_DIR", Path(__file__).resolve().parent / "browser_profile"))
 
 
 def normalize_douyin_url(value: str) -> str:
@@ -159,17 +160,22 @@ class DouyinSession:
             self._report("启动 Chromium")
             self._playwright = sync_playwright().start()
             PROFILE_DIR.mkdir(exist_ok=True)
+            browser_path = os.environ.get("VIDPICK_CHROMIUM", "").strip()
             self._context = self._playwright.chromium.launch_persistent_context(
                 str(PROFILE_DIR), headless=True,
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
+                **({"executable_path": browser_path} if browser_path else {}),
                 viewport={"width": 1440, "height": 1000},
             )
+            cookies_path = os.environ.get("VIDPICK_COOKIES", "").strip()
+            if cookies_path and Path(cookies_path).is_file():
+                cookie_data = json.loads(Path(cookies_path).read_text(encoding="utf-8"))
+                cookies = cookie_data.get("cookies", []) if isinstance(cookie_data, dict) else cookie_data
+                if not isinstance(cookies, list):
+                    raise DouyinParseError("cookies.json 格式不正确，需要 Playwright cookies 列表")
+                if cookies:
+                    self._context.add_cookies(cookies)
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.on("response", self._capture_response)
             return self

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -622,7 +623,17 @@ def _download_to_stem(url: str, stem: Path) -> Path:
 def _download_video_to_path(url: str, destination: Path) -> None:
     """Download to a part file, then atomically replace only a complete video."""
 
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"})
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"}
+    cookies_path = os.environ.get("VIDPICK_COOKIES", "").strip()
+    if cookies_path and Path(cookies_path).is_file():
+        cookie_data = json.loads(Path(cookies_path).read_text(encoding="utf-8"))
+        cookies = cookie_data.get("cookies", []) if isinstance(cookie_data, dict) else cookie_data
+        host = (urlparse(url).hostname or "").lower()
+        if isinstance(cookies, list):
+            matching = [f"{item['name']}={item['value']}" for item in cookies if isinstance(item, dict) and all(key in item for key in ("name", "value", "domain")) and (host == str(item["domain"]).lstrip(".").lower() or host.endswith("." + str(item["domain"]).lstrip(".").lower()))]
+            if matching:
+                headers["Cookie"] = "; ".join(matching)
+    request = Request(url, headers=headers)
     temporary_path: Path | None = None
     try:
         with urlopen(request, timeout=30) as response:
